@@ -1,0 +1,19 @@
+[package]
+name = "foxmail-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview" }
+gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = ["font-kit"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
