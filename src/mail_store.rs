@@ -141,6 +141,23 @@ pub struct MessageSummary {
     pub attachment_count: usize,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageDetail {
+    pub id: i64,
+    pub mailbox_id: i64,
+    pub uid: u32,
+    pub subject: String,
+    pub sender: String,
+    pub recipients: String,
+    pub date_text: Option<String>,
+    pub date_unix: Option<i64>,
+    pub body: String,
+    pub html_body: String,
+    pub attachment_count: usize,
+    pub size_bytes: usize,
+    pub eml_path: String,
+}
+
 pub struct MailStore {
     connection: Connection,
 }
@@ -345,6 +362,82 @@ impl MailStore {
             });
         }
         Ok(messages)
+    }
+
+    pub fn message_detail(&self, message_id: i64) -> StoreResult<Option<MessageDetail>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT id,
+                        mailbox_id,
+                        uid,
+                        subject,
+                        sender,
+                        recipients,
+                        date_text,
+                        date_unix,
+                        body,
+                        html_body,
+                        attachment_count,
+                        size_bytes,
+                        eml_path
+                 FROM message
+                 WHERE id = ?1",
+                params![message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
+            id,
+            mailbox_id,
+            uid,
+            subject,
+            sender,
+            recipients,
+            date_text,
+            date_unix,
+            body,
+            html_body,
+            attachment_count,
+            size_bytes,
+            eml_path,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(MessageDetail {
+            id,
+            mailbox_id,
+            uid,
+            subject,
+            sender,
+            recipients,
+            date_text,
+            date_unix,
+            body,
+            html_body,
+            attachment_count: usize::try_from(attachment_count)?,
+            size_bytes: usize::try_from(size_bytes)?,
+            eml_path,
+        }))
     }
 
     pub fn integrity_check(&self) -> StoreResult<IntegrityReport> {
@@ -791,6 +884,21 @@ Content-Transfer-Encoding: 8bit\r\n\
         assert_eq!(first_page[0].sender, "Sender <sender@example.com>");
         assert!(first_page[0].date_unix.is_some());
 
+        let detail = store
+            .message_detail(first_page[0].id)
+            .unwrap()
+            .expect("message detail should exist");
+        assert_eq!(detail.mailbox_id, mailbox_id);
+        assert_eq!(detail.uid, 9);
+        assert_eq!(detail.subject, "第九封");
+        assert_eq!(detail.sender, "Sender <sender@example.com>");
+        assert_eq!(detail.recipients, "receiver@example.com");
+        assert!(detail.body.contains("正文。"));
+        assert!(detail.html_body.contains("正文。"));
+        assert_eq!(detail.attachment_count, 0);
+        assert!(detail.size_bytes > 0);
+        assert!(detail.eml_path.ends_with("0000000009.eml"));
+
         let second_page = store.message_page(mailbox_id, 2, 2).unwrap();
         assert_eq!(
             second_page
@@ -801,6 +909,7 @@ Content-Transfer-Encoding: 8bit\r\n\
         );
         assert!(store.message_page(mailbox_id, 0, 0).unwrap().is_empty());
         assert!(store.message_page(i64::MAX, 0, 10).unwrap().is_empty());
+        assert!(store.message_detail(i64::MAX).unwrap().is_none());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

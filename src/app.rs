@@ -1,4 +1,4 @@
-use foxmail_imap::mail_store::{MailStore, MailboxAccount, MessageSummary};
+use foxmail_imap::mail_store::{MailStore, MailboxAccount, MessageDetail, MessageSummary};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, uniform_list, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
@@ -24,6 +24,9 @@ pub struct MailApp {
     message_pages: HashMap<usize, Vec<MessageSummary>>,
     message_load_error: Option<SharedString>,
     message_scroll: UniformListScrollHandle,
+    selected_message: Option<i64>,
+    selected_detail: Option<MessageDetail>,
+    detail_load_error: Option<SharedString>,
 }
 
 impl MailApp {
@@ -62,6 +65,9 @@ impl MailApp {
             message_pages: HashMap::new(),
             message_load_error: None,
             message_scroll: UniformListScrollHandle::new(),
+            selected_message: None,
+            selected_detail: None,
+            detail_load_error: None,
         }
     }
 
@@ -79,9 +85,39 @@ impl MailApp {
         self.selected_mailbox = Some(id);
         self.message_pages.clear();
         self.message_load_error = None;
+        self.selected_message = None;
+        self.selected_detail = None;
+        self.detail_load_error = None;
         if self.selected_count() > 0 {
             self.message_scroll
                 .scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn select_message(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.selected_message == Some(id) && self.selected_detail.is_some() {
+            return;
+        }
+
+        self.selected_message = Some(id);
+        self.selected_detail = None;
+        self.detail_load_error = None;
+        match self.store.as_ref().map(|store| store.message_detail(id)) {
+            Some(Ok(Some(detail))) => {
+                self.selected_detail = Some(detail);
+            }
+            Some(Ok(None)) => {
+                self.selected_message = None;
+                self.detail_load_error = Some("邮件已不存在，请重新生成索引".into());
+            }
+            Some(Err(error)) => {
+                self.detail_load_error = Some(SharedString::from(error.to_string()));
+            }
+            None => {
+                self.selected_message = None;
+                self.detail_load_error = Some("邮件索引未打开".into());
+            }
         }
         cx.notify();
     }
@@ -315,11 +351,17 @@ impl MailApp {
             .cloned()
     }
 
-    fn render_message_rows(&mut self, range: Range<usize>) -> Vec<AnyElement> {
+    fn render_message_rows(
+        &mut self,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let theme = self.theme;
         range
             .filter_map(|index| {
                 self.message_at(index).map(|message| {
+                    let message_id = message.id;
+                    let active = self.selected_message == Some(message_id);
                     let subject = nonempty_label(&message.subject, "（无主题）");
                     let sender = nonempty_label(&message.sender, "未知发件人");
                     let date = compact_date(message.date_text.as_deref());
@@ -331,13 +373,29 @@ impl MailApp {
 
                     div()
                         .id(("message", u64::try_from(message.id).unwrap_or_default()))
+                        .relative()
                         .h(px(76.))
                         .px_4()
                         .py_3()
                         .border_b_1()
                         .border_color(theme.border)
                         .cursor_pointer()
+                        .when(active, |style| style.bg(theme.active))
                         .hover(|style| style.bg(theme.raised))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_message(message_id, cx);
+                        }))
+                        .when(active, |element| {
+                            element.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(12.))
+                                    .h(px(52.))
+                                    .w(px(2.))
+                                    .bg(theme.accent),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()
@@ -384,7 +442,7 @@ impl MailApp {
         let list = uniform_list(
             "message-list",
             message_count,
-            cx.processor(|this, range, _window, _cx| this.render_message_rows(range)),
+            cx.processor(|this, range, _window, cx| this.render_message_rows(range, cx)),
         )
         .track_scroll(&self.message_scroll)
         .h_full()
@@ -451,17 +509,74 @@ impl MailApp {
 
     fn render_reader(&self) -> impl IntoElement {
         let theme = self.theme;
-        div()
+        let mut reader = div()
             .h_full()
             .min_w_0()
             .flex_1()
             .bg(theme.canvas)
             .flex()
-            .items_center()
-            .justify_center()
-            .text_color(theme.text_tertiary)
-            .text_sm()
-            .child("未选择邮件")
+            .flex_col();
+
+        if let Some(detail) = &self.selected_detail {
+            let subject = nonempty_label(&detail.subject, "（无主题）");
+            let sender = nonempty_label(&detail.sender, "未知发件人");
+            let recipients = nonempty_label(&detail.recipients, "未记录收件人");
+            let date = nonempty_label(&compact_date(detail.date_text.as_deref()), "未知时间");
+            let attachments = if detail.attachment_count == 0 {
+                "无附件".to_owned()
+            } else {
+                format!("{} 个附件", detail.attachment_count)
+            };
+
+            reader = reader
+                .child(
+                    div()
+                        .px_6()
+                        .py_5()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .line_clamp(2)
+                                .text_color(theme.text)
+                                .text_lg()
+                                .child(SharedString::from(subject)),
+                        )
+                        .child(detail_row(theme, "发件人", sender))
+                        .child(detail_row(theme, "收件人", recipients))
+                        .child(detail_row(theme, "时间", date))
+                        .child(detail_row(theme, "附件", attachments)),
+                )
+                .child(div().flex_1());
+        } else if let Some(error) = &self.detail_load_error {
+            reader = reader.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px_6()
+                    .text_color(theme.text_secondary)
+                    .text_sm()
+                    .child(error.clone()),
+            );
+        } else {
+            reader = reader.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.text_tertiary)
+                    .text_sm()
+                    .child("未选择邮件"),
+            );
+        }
+
+        reader
     }
 }
 
@@ -504,6 +619,32 @@ fn mailbox_label(source_name: &str, display_name: &str) -> String {
         "JUNK" | "SPAM" => "垃圾箱".to_owned(),
         _ => display_name.to_owned(),
     }
+}
+
+fn detail_row(theme: Theme, label: &'static str, value: String) -> impl IntoElement {
+    div()
+        .mt_3()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .w(px(48.))
+                .flex_shrink_0()
+                .text_color(theme.text_tertiary)
+                .text_xs()
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .text_ellipsis()
+                .line_clamp(2)
+                .text_color(theme.text_secondary)
+                .text_sm()
+                .child(SharedString::from(value)),
+        )
 }
 
 fn nonempty_label(value: &str, fallback: &str) -> String {
