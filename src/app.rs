@@ -550,7 +550,7 @@ impl MailApp {
                         .child(detail_row(theme, "时间", date))
                         .child(detail_row(theme, "附件", attachments)),
                 )
-                .child(div().flex_1());
+                .child(render_plain_body(theme, &detail.body));
         } else if let Some(error) = &self.detail_load_error {
             reader = reader.child(
                 div()
@@ -647,6 +647,41 @@ fn detail_row(theme: Theme, label: &'static str, value: String) -> impl IntoElem
         )
 }
 
+fn render_plain_body(theme: Theme, value: &str) -> impl IntoElement {
+    let body = normalize_plain_body(value);
+    let empty = body.is_empty();
+    let text = if empty {
+        "正文为空".to_owned()
+    } else {
+        body
+    };
+
+    div()
+        .id("message-body")
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .overflow_y_scroll()
+        .px_6()
+        .py_5()
+        .text_color(if empty {
+            theme.text_tertiary
+        } else {
+            theme.text_secondary
+        })
+        .text_sm()
+        .line_height(px(22.))
+        .child(SharedString::from(text))
+}
+
+fn normalize_plain_body(value: &str) -> String {
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end()
+        .to_owned()
+}
+
 fn nonempty_label(value: &str, fallback: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -666,7 +701,9 @@ fn compact_date(value: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_date, mailbox_label, nonempty_label, resolve_index_path};
+    use super::{
+        compact_date, mailbox_label, nonempty_label, normalize_plain_body, resolve_index_path,
+    };
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -705,5 +742,14 @@ mod tests {
             compact_date(Some("2026-08-17 09:00:00 +08:00")),
             "2026-08-17 09:00"
         );
+    }
+
+    #[test]
+    fn normalizes_plain_body_line_endings_without_losing_content() {
+        assert_eq!(
+            normalize_plain_body("第一行\r\n\r\n第二行\r"),
+            "第一行\n\n第二行"
+        );
+        assert_eq!(normalize_plain_body("  \r\n"), "");
     }
 }
