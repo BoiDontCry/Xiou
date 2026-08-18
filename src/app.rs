@@ -1,4 +1,6 @@
-use foxmail_imap::mail_store::{MailStore, MailboxAccount, MessageDetail, MessageSummary};
+use foxmail_imap::mail_store::{
+    AttachmentMeta, MailStore, MailboxAccount, MessageDetail, MessageSummary,
+};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, uniform_list, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
@@ -548,7 +550,13 @@ impl MailApp {
                         .child(detail_row(theme, "发件人", sender))
                         .child(detail_row(theme, "收件人", recipients))
                         .child(detail_row(theme, "时间", date))
-                        .child(detail_row(theme, "附件", attachments)),
+                        .child(detail_row(theme, "附件", attachments))
+                        .child(render_attachment_list(
+                            theme,
+                            &detail.attachments,
+                            detail.attachment_count,
+                            detail.attachment_load_error.as_deref(),
+                        )),
                 )
                 .child(render_plain_body(theme, &detail.body));
         } else if let Some(error) = &self.detail_load_error {
@@ -674,6 +682,95 @@ fn render_plain_body(theme: Theme, value: &str) -> impl IntoElement {
         .child(SharedString::from(text))
 }
 
+fn render_attachment_list(
+    theme: Theme,
+    attachments: &[AttachmentMeta],
+    attachment_count: usize,
+    load_error: Option<&str>,
+) -> impl IntoElement {
+    let mut section = div();
+    if attachment_count == 0 {
+        return section;
+    }
+
+    section = section
+        .mt_4()
+        .pt_3()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_color(theme.text_secondary)
+                .text_xs()
+                .child(SharedString::from(format!("附件（{}）", attachment_count))),
+        );
+
+    if attachments.is_empty() {
+        return section.child(
+            div()
+                .mt_2()
+                .text_color(theme.text_tertiary)
+                .text_xs()
+                .child(if load_error.is_some() {
+                    "附件信息暂不可用"
+                } else {
+                    "未解析到附件信息"
+                }),
+        );
+    }
+
+    for attachment in attachments {
+        let filename = nonempty_label(&attachment.filename, "未命名附件");
+        let marker = if attachment.inline {
+            "内嵌"
+        } else {
+            "附件"
+        };
+        let metadata = format!(
+            "{} · {} · {}",
+            marker,
+            attachment.content_type,
+            format_bytes(attachment.size_bytes)
+        );
+        section = section.child(
+            div()
+                .mt_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.text)
+                        .text_sm()
+                        .child(SharedString::from(filename)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.text_tertiary)
+                        .text_xs()
+                        .child(SharedString::from(metadata)),
+                ),
+        );
+    }
+
+    section
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes < KIB {
+        format!("{} B", bytes as usize)
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{:.1} MiB", bytes / MIB)
+    }
+}
+
 fn normalize_plain_body(value: &str) -> String {
     value
         .replace("\r\n", "\n")
@@ -702,7 +799,8 @@ fn compact_date(value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_date, mailbox_label, nonempty_label, normalize_plain_body, resolve_index_path,
+        compact_date, format_bytes, mailbox_label, nonempty_label, normalize_plain_body,
+        resolve_index_path,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -751,5 +849,12 @@ mod tests {
             "第一行\n\n第二行"
         );
         assert_eq!(normalize_plain_body("  \r\n"), "");
+    }
+
+    #[test]
+    fn formats_attachment_sizes_for_compact_metadata() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MiB");
     }
 }

@@ -1,5 +1,5 @@
 use crate::imap_utf7;
-use mail_parser::{Address, MessageParser};
+use mail_parser::{Address, MessageParser, MimeHeaders};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -142,6 +142,14 @@ pub struct MessageSummary {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AttachmentMeta {
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: usize,
+    pub inline: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct MessageDetail {
     pub id: i64,
     pub mailbox_id: i64,
@@ -154,12 +162,15 @@ pub struct MessageDetail {
     pub body: String,
     pub html_body: String,
     pub attachment_count: usize,
+    pub attachments: Vec<AttachmentMeta>,
+    pub attachment_load_error: Option<String>,
     pub size_bytes: usize,
     pub eml_path: String,
 }
 
 pub struct MailStore {
     connection: Connection,
+    source_root: Option<PathBuf>,
 }
 
 impl MailStore {
@@ -172,13 +183,19 @@ impl MailStore {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(SCHEMA)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            source_root: source_root(path),
+        })
     }
 
     pub fn open_read_only(path: &Path) -> StoreResult<Self> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            source_root: source_root(path),
+        })
     }
 
     pub fn import_backup(&mut self, data_root: &Path) -> StoreResult<ImportSummary> {
@@ -423,6 +440,13 @@ impl MailStore {
             return Ok(None);
         };
 
+        let attachment_path = self.resolve_source_path(&eml_path);
+        let (attachments, attachment_load_error) = match read_attachment_metadata(&attachment_path)
+        {
+            Ok(attachments) => (attachments, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+
         Ok(Some(MessageDetail {
             id,
             mailbox_id,
@@ -435,9 +459,22 @@ impl MailStore {
             body,
             html_body,
             attachment_count: usize::try_from(attachment_count)?,
+            attachments,
+            attachment_load_error,
             size_bytes: usize::try_from(size_bytes)?,
             eml_path,
         }))
+    }
+
+    fn resolve_source_path(&self, stored_path: &str) -> PathBuf {
+        let path = Path::new(stored_path);
+        if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.source_root
+                .as_deref()
+                .map_or_else(|| path.to_owned(), |root| root.join(path))
+        }
     }
 
     pub fn integrity_check(&self) -> StoreResult<IntegrityReport> {
@@ -456,6 +493,52 @@ impl MailStore {
             fts5_external_content: "ok".to_owned(),
         })
     }
+}
+
+fn source_root(database_path: &Path) -> Option<PathBuf> {
+    database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+fn read_attachment_metadata(path: &Path) -> StoreResult<Vec<AttachmentMeta>> {
+    let raw = fs::read(path)?;
+    let message = MessageParser::default()
+        .parse(&raw)
+        .ok_or_else(|| format!("无法解析 RFC822/MIME 邮件：{}", path.display()))?;
+
+    Ok(message
+        .attachments()
+        .enumerate()
+        .map(|(index, part)| {
+            let content_type = part
+                .content_type()
+                .map(|content_type| {
+                    format!(
+                        "{}/{}",
+                        content_type.ctype(),
+                        content_type.subtype().unwrap_or("octet-stream")
+                    )
+                })
+                .unwrap_or_else(|| "application/octet-stream".to_owned());
+            let filename = part
+                .attachment_name()
+                .filter(|name| !name.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("附件 {}", index + 1));
+            let inline = part
+                .content_disposition()
+                .is_some_and(|disposition| disposition.is_inline());
+
+            AttachmentMeta {
+                filename,
+                content_type,
+                size_bytes: part.len(),
+                inline,
+            }
+        })
+        .collect())
 }
 
 fn import_mailbox(
@@ -725,7 +808,7 @@ fn collect_bodies(mut count: usize, mut get: impl FnMut(usize) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use super::MailStore;
+    use super::{read_attachment_metadata, MailStore};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -896,6 +979,8 @@ Content-Transfer-Encoding: 8bit\r\n\
         assert!(detail.body.contains("正文。"));
         assert!(detail.html_body.contains("正文。"));
         assert_eq!(detail.attachment_count, 0);
+        assert!(detail.attachments.is_empty());
+        assert!(detail.attachment_load_error.is_none());
         assert!(detail.size_bytes > 0);
         assert!(detail.eml_path.ends_with("0000000009.eml"));
 
@@ -912,6 +997,44 @@ Content-Transfer-Encoding: 8bit\r\n\
         assert!(store.message_detail(i64::MAX).unwrap().is_none());
 
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_attachment_metadata_from_multipart_eml() {
+        let root = temporary_directory("attachment-metadata");
+        fs::create_dir_all(&root).unwrap();
+        let eml = root.join("attachment.eml");
+        fs::write(
+            &eml,
+            "From: sender@example.com\r\n\
+To: receiver@example.com\r\n\
+Date: Mon, 17 Aug 2026 09:00:00 +0800\r\n\
+Subject: Attachment metadata\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=foxmail-boundary\r\n\
+\r\n\
+--foxmail-boundary\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+hello\r\n\
+--foxmail-boundary\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=test.bin\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+AAE=\r\n\
+--foxmail-boundary--\r\n",
+        )
+        .unwrap();
+
+        let attachments = read_attachment_metadata(&eml).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "test.bin");
+        assert_eq!(attachments[0].content_type, "application/octet-stream");
+        assert_eq!(attachments[0].size_bytes, 2);
+        assert!(!attachments[0].inline);
+
         fs::remove_dir_all(root).unwrap();
     }
 
