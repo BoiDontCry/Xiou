@@ -23,6 +23,10 @@ path = "src/validate_eml.rs"
 name = "import-eml"
 path = "src/import_eml.rs"
 
+[[bin]]
+name = "foxmail-rs"
+path = "src/main.rs"
+
 [dependencies]
 imap = "3.0.0-alpha.15"
 imap-proto = "0.16.7"
@@ -36,6 +40,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
 ] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview" }
+gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = ["font-kit"] }
 
 [profile.release]
 lto = "thin"

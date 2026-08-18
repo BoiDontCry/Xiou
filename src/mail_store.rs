@@ -1,6 +1,6 @@
 use crate::imap_utf7;
 use mail_parser::{Address, MessageParser};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -115,6 +115,32 @@ pub struct SearchHit {
     pub eml_path: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailboxAccount {
+    pub account: String,
+    pub server: String,
+    pub mailboxes: Vec<MailboxSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MailboxSummary {
+    pub id: i64,
+    pub source_name: String,
+    pub display_name: String,
+    pub message_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MessageSummary {
+    pub id: i64,
+    pub uid: u32,
+    pub subject: String,
+    pub sender: String,
+    pub date_text: Option<String>,
+    pub date_unix: Option<i64>,
+    pub attachment_count: usize,
+}
+
 pub struct MailStore {
     connection: Connection,
 }
@@ -129,6 +155,12 @@ impl MailStore {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(SCHEMA)?;
+        Ok(Self { connection })
+    }
+
+    pub fn open_read_only(path: &Path) -> StoreResult<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
         Ok(Self { connection })
     }
 
@@ -186,6 +218,133 @@ impl MailStore {
             .connection
             .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))?;
         Ok(usize::try_from(count)?)
+    }
+
+    pub fn mailbox_tree(&self) -> StoreResult<Vec<MailboxAccount>> {
+        let mut statement = self.connection.prepare(
+            "WITH mailbox_generation AS (
+                 SELECT mb.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY mb.account,
+                                         mb.server,
+                                         CASE
+                                             WHEN mb.source_name COLLATE NOCASE = 'INBOX'
+                                             THEN 'INBOX'
+                                             ELSE mb.source_name
+                                         END
+                            ORDER BY mb.scanned_at_unix DESC,
+                                     mb.uid_validity DESC,
+                                     mb.id DESC
+                        ) AS generation_rank
+                 FROM mailbox AS mb
+             )
+             SELECT mb.id,
+                    mb.account,
+                    mb.server,
+                    mb.source_name,
+                    mb.display_name,
+                    COUNT(m.id)
+             FROM mailbox_generation AS mb
+             LEFT JOIN message AS m ON m.mailbox_id = mb.id
+             WHERE mb.generation_rank = 1
+             GROUP BY mb.id
+             ORDER BY mb.account COLLATE NOCASE,
+                      mb.account,
+                      mb.server COLLATE NOCASE,
+                      mb.server,
+                      CASE WHEN mb.source_name COLLATE NOCASE = 'INBOX' THEN 0 ELSE 1 END,
+                      mb.display_name COLLATE NOCASE,
+                      mb.source_name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut accounts: Vec<MailboxAccount> = Vec::new();
+        for row in rows {
+            let (id, account, server, source_name, display_name, message_count) = row?;
+            let starts_new_account = accounts
+                .last()
+                .is_none_or(|item| item.account != account || item.server != server);
+            if starts_new_account {
+                accounts.push(MailboxAccount {
+                    account: account.clone(),
+                    server: server.clone(),
+                    mailboxes: Vec::new(),
+                });
+            }
+            accounts
+                .last_mut()
+                .expect("account was inserted above")
+                .mailboxes
+                .push(MailboxSummary {
+                    id,
+                    source_name,
+                    display_name,
+                    message_count: usize::try_from(message_count)?,
+                });
+        }
+        Ok(accounts)
+    }
+
+    pub fn message_page(
+        &self,
+        mailbox_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> StoreResult<Vec<MessageSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let offset = i64::try_from(offset)?;
+        let limit = i64::try_from(limit.min(200))?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,
+                    uid,
+                    subject,
+                    sender,
+                    date_text,
+                    date_unix,
+                    attachment_count
+             FROM message
+             WHERE mailbox_id = ?1
+             ORDER BY date_unix DESC, uid DESC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = statement.query_map(params![mailbox_id, limit, offset], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let (id, uid, subject, sender, date_text, date_unix, attachment_count) = row?;
+            messages.push(MessageSummary {
+                id,
+                uid,
+                subject,
+                sender,
+                date_text,
+                date_unix,
+                attachment_count: usize::try_from(attachment_count)?,
+            });
+        }
+        Ok(messages)
     }
 
     pub fn integrity_check(&self) -> StoreResult<IntegrityReport> {
@@ -535,6 +694,172 @@ Content-Transfer-Encoding: 8bit\r\n\
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn returns_mailboxes_grouped_by_account_with_inbox_first() {
+        let root = temporary_directory("mailbox-tree");
+        write_mailbox(&root, "zeta@example.com", "&XfJT0ZAB-", 42, 123, &[]);
+        write_mailbox(
+            &root,
+            "alpha@example.com",
+            "&XfJT0ZAB-",
+            42,
+            123,
+            &[(7, "第一封"), (8, "第二封")],
+        );
+        write_mailbox(
+            &root,
+            "alpha@example.com",
+            "Inbox",
+            42,
+            100,
+            &[(9, "收件箱邮件")],
+        );
+        write_mailbox(
+            &root,
+            "alpha@example.com",
+            "INBOX",
+            43,
+            200,
+            &[(10, "新世代一"), (11, "新世代二")],
+        );
+        write_mailbox(
+            &root,
+            "Alpha@example.com",
+            "inbox",
+            42,
+            123,
+            &[(12, "大小写收件箱")],
+        );
+        write_mailbox(&root, "Alpha@example.com", "&XfJT0ZAB-", 42, 123, &[]);
+
+        let database = root.join("mail.sqlite");
+        let mut store = MailStore::open(&database).unwrap();
+        store.import_backup(&root).unwrap();
+
+        drop(store);
+        let store = MailStore::open_read_only(&database).unwrap();
+        let accounts = store.mailbox_tree().unwrap();
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts[0].account, "Alpha@example.com");
+        assert_eq!(accounts[0].mailboxes.len(), 2);
+        assert_eq!(accounts[0].mailboxes[0].source_name, "inbox");
+        assert_eq!(accounts[0].mailboxes[0].message_count, 1);
+        assert_eq!(accounts[1].account, "alpha@example.com");
+        assert_eq!(accounts[1].mailboxes.len(), 2);
+        assert_eq!(accounts[1].mailboxes[0].source_name, "INBOX");
+        assert_eq!(accounts[1].mailboxes[0].message_count, 2);
+        assert_eq!(accounts[1].mailboxes[1].display_name, "已发送");
+        assert_eq!(accounts[1].mailboxes[1].message_count, 2);
+        assert_ne!(accounts[1].mailboxes[0].id, accounts[1].mailboxes[1].id);
+        assert_eq!(accounts[2].account, "zeta@example.com");
+        assert_eq!(accounts[2].mailboxes[0].message_count, 0);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pages_message_summaries_in_stable_newest_first_order() {
+        let root = temporary_directory("message-page");
+        write_mailbox(
+            &root,
+            "reader@example.com",
+            "INBOX",
+            42,
+            123,
+            &[(7, "第七封"), (9, "第九封"), (8, "第八封")],
+        );
+
+        let database = root.join("mail.sqlite");
+        let mut store = MailStore::open(&database).unwrap();
+        store.import_backup(&root).unwrap();
+        let mailbox_id = store.mailbox_tree().unwrap()[0].mailboxes[0].id;
+
+        drop(store);
+        let store = MailStore::open_read_only(&database).unwrap();
+        let first_page = store.message_page(mailbox_id, 0, 2).unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|message| message.uid)
+                .collect::<Vec<_>>(),
+            vec![9, 8]
+        );
+        assert_eq!(first_page[0].subject, "第九封");
+        assert_eq!(first_page[0].sender, "Sender <sender@example.com>");
+        assert!(first_page[0].date_unix.is_some());
+
+        let second_page = store.message_page(mailbox_id, 2, 2).unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|message| message.uid)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert!(store.message_page(mailbox_id, 0, 0).unwrap().is_empty());
+        assert!(store.message_page(i64::MAX, 0, 10).unwrap().is_empty());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_mailbox(
+        root: &Path,
+        account: &str,
+        mailbox_name: &str,
+        uid_validity: u32,
+        scanned_at_unix: u64,
+        messages: &[(u32, &str)],
+    ) {
+        let mailbox = root
+            .join(fixture_component(account))
+            .join(fixture_component(mailbox_name))
+            .join(format!("uidvalidity-{uid_validity}"));
+        fs::create_dir_all(&mailbox).unwrap();
+        fs::write(
+            mailbox.join("mailbox.meta.json"),
+            serde_json::to_vec_pretty(&json!({
+                "account": account,
+                "server": "imap.example.com",
+                "mailbox": mailbox_name,
+                "uid_validity": uid_validity,
+                "scanned_at_unix": scanned_at_unix,
+                "server_message_count": messages.len(),
+                "discovered_uid_count": messages.len()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        for (uid, subject) in messages {
+            fs::write(
+                mailbox.join(format!("{uid:010}.eml")),
+                format!(
+                    "From: Sender <sender@example.com>\r\n\
+To: receiver@example.com\r\n\
+Date: Mon, 17 Aug 2026 09:00:00 +0800\r\n\
+Subject: {subject}\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: 8bit\r\n\
+\r\n\
+正文。\r\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn fixture_component(value: &str) -> String {
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     fn temporary_directory(label: &str) -> PathBuf {
