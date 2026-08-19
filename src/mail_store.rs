@@ -102,9 +102,10 @@ pub struct IntegrityReport {
     pub fts5_external_content: String,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SearchHit {
     pub id: i64,
+    pub mailbox_id: i64,
     pub mailbox: String,
     pub uid: u32,
     pub subject: String,
@@ -216,6 +217,7 @@ impl MailStore {
         let limit = i64::try_from(limit.min(1_000))?;
         let mut statement = self.connection.prepare(
             "SELECT m.id,
+                    m.mailbox_id,
                     mb.display_name,
                     m.uid,
                     m.subject,
@@ -234,14 +236,15 @@ impl MailStore {
         let rows = statement.query_map(params![query, limit], |row| {
             Ok(SearchHit {
                 id: row.get(0)?,
-                mailbox: row.get(1)?,
-                uid: row.get(2)?,
-                subject: row.get(3)?,
-                sender: row.get(4)?,
-                recipients: row.get(5)?,
-                date_text: row.get(6)?,
-                snippet: row.get(7)?,
-                eml_path: row.get(8)?,
+                mailbox_id: row.get(1)?,
+                mailbox: row.get(2)?,
+                uid: row.get(3)?,
+                subject: row.get(4)?,
+                sender: row.get(5)?,
+                recipients: row.get(6)?,
+                date_text: row.get(7)?,
+                snippet: row.get(8)?,
+                eml_path: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -860,8 +863,11 @@ Content-Transfer-Encoding: 8bit\r\n\
 
         let hits = store.search("中文全文", 10).unwrap();
         assert_eq!(hits.len(), 1);
+        assert!(hits[0].mailbox_id > 0);
         assert_eq!(hits[0].mailbox, "台北");
         assert_eq!(hits[0].uid, 7);
+        assert!(store.search("不存在的词", 10).unwrap().is_empty());
+        assert!(store.search("\"", 10).is_err());
 
         let second = store.import_backup(&root).unwrap();
         assert_eq!(second.inserted, 0);

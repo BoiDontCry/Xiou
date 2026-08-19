@@ -1,11 +1,11 @@
 use foxmail_imap::mail_store::{
-    AttachmentMeta, MailStore, MailboxAccount, MessageDetail, MessageSummary,
+    AttachmentMeta, MailStore, MailboxAccount, MessageDetail, MessageSummary, SearchHit,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, uniform_list, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
-    UniformListScrollHandle, Window,
+    div, px, relative, uniform_list, AnyElement, Context, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -26,13 +26,18 @@ pub struct MailApp {
     message_pages: HashMap<usize, Vec<MessageSummary>>,
     message_load_error: Option<SharedString>,
     message_scroll: UniformListScrollHandle,
+    body_scroll: ScrollHandle,
     selected_message: Option<i64>,
     selected_detail: Option<MessageDetail>,
     detail_load_error: Option<SharedString>,
+    search_query: String,
+    search_results: Vec<SearchHit>,
+    search_error: Option<SharedString>,
+    search_focus: FocusHandle,
 }
 
 impl MailApp {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let index_path = index_path();
         let result = if index_path.is_file() {
             MailStore::open_read_only(&index_path).and_then(|store| {
@@ -67,9 +72,14 @@ impl MailApp {
             message_pages: HashMap::new(),
             message_load_error: None,
             message_scroll: UniformListScrollHandle::new(),
+            body_scroll: ScrollHandle::new(),
             selected_message: None,
             selected_detail: None,
             detail_load_error: None,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_error: None,
+            search_focus: cx.focus_handle(),
         }
     }
 
@@ -80,21 +90,102 @@ impl MailApp {
         cx.notify();
     }
 
-    fn select_mailbox(&mut self, id: i64, cx: &mut Context<Self>) {
-        if self.selected_mailbox == Some(id) {
+    fn select_mailbox(&mut self, id: i64, clear_search: bool, cx: &mut Context<Self>) {
+        let mailbox_changed = self.selected_mailbox != Some(id);
+        if !mailbox_changed && !clear_search {
             return;
         }
-        self.selected_mailbox = Some(id);
-        self.message_pages.clear();
-        self.message_load_error = None;
-        self.selected_message = None;
-        self.selected_detail = None;
-        self.detail_load_error = None;
-        if self.selected_count() > 0 {
-            self.message_scroll
-                .scroll_to_item_strict(0, ScrollStrategy::Top);
+
+        if mailbox_changed {
+            self.selected_mailbox = Some(id);
+            self.message_pages.clear();
+            self.message_load_error = None;
+            self.selected_message = None;
+            self.selected_detail = None;
+            self.detail_load_error = None;
+            self.body_scroll.set_offset(Default::default());
+            if self.selected_count() > 0 {
+                self.message_scroll
+                    .scroll_to_item_strict(0, ScrollStrategy::Top);
+            }
+        }
+        if clear_search {
+            self.search_query.clear();
+            self.search_results.clear();
+            self.search_error = None;
         }
         cx.notify();
+    }
+
+    fn handle_search_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key.eq_ignore_ascii_case("escape") {
+            self.search_query.clear();
+            self.search_results.clear();
+            self.search_error = None;
+            cx.notify();
+            return;
+        }
+        if key.eq_ignore_ascii_case("backspace") {
+            self.search_query.pop();
+            self.run_search();
+            cx.notify();
+            return;
+        }
+        if key.eq_ignore_ascii_case("enter") {
+            if let Some(hit) = self.search_results.first().cloned() {
+                self.select_mailbox(hit.mailbox_id, false, cx);
+                self.select_message(hit.id, cx);
+            }
+            return;
+        }
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+        {
+            return;
+        }
+        let character = event
+            .keystroke
+            .key_char
+            .as_deref()
+            .or_else(|| (event.keystroke.key.chars().count() == 1).then_some(key));
+        let Some(character) = character else { return };
+        if character.chars().all(char::is_control) {
+            return;
+        }
+        self.search_query.push_str(character);
+        self.run_search();
+        cx.notify();
+    }
+
+    fn run_search(&mut self) {
+        let query = self.search_query.trim();
+        if query.is_empty() {
+            self.search_results.clear();
+            self.search_error = None;
+            return;
+        }
+        let Some(store) = &self.store else {
+            self.search_results.clear();
+            self.search_error = Some("邮件索引未打开".into());
+            return;
+        };
+        match store.search(query, 100) {
+            Ok(results) => {
+                self.search_results = results;
+                self.search_error = None;
+            }
+            Err(error) => {
+                self.search_results.clear();
+                self.search_error = Some(SharedString::from(error.to_string()));
+            }
+        }
     }
 
     fn select_message(&mut self, id: i64, cx: &mut Context<Self>) {
@@ -105,6 +196,7 @@ impl MailApp {
         self.selected_message = Some(id);
         self.selected_detail = None;
         self.detail_load_error = None;
+        self.body_scroll.set_offset(Default::default());
         match self.store.as_ref().map(|store| store.message_detail(id)) {
             Some(Ok(Some(detail))) => {
                 self.selected_detail = Some(detail);
@@ -227,7 +319,7 @@ impl MailApp {
                         .when(active, |style| style.bg(theme.active))
                         .hover(|style| style.bg(theme.raised))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_mailbox(mailbox_id, cx);
+                            this.select_mailbox(mailbox_id, true, cx);
                         }))
                         .when(active, |element| {
                             element.child(
@@ -292,7 +384,8 @@ impl MailApp {
 
         div()
             .h_full()
-            .w(px(248.))
+            .w(relative(0.12))
+            .min_w(px(144.))
             .flex_shrink_0()
             .bg(theme.sidebar)
             .border_r_1()
@@ -438,8 +531,11 @@ impl MailApp {
             .collect()
     }
 
-    fn render_message_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_message_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
+        if !self.search_query.trim().is_empty() {
+            return self.render_search_results(cx);
+        }
         let message_count = self.selected_count();
         let list = uniform_list(
             "message-list",
@@ -452,13 +548,15 @@ impl MailApp {
 
         div()
             .h_full()
-            .w(px(360.))
+            .w(relative(0.18))
+            .min_w(px(220.))
             .flex_shrink_0()
             .bg(theme.surface)
             .border_r_1()
             .border_color(theme.border)
             .flex()
             .flex_col()
+            .child(self.render_search_bar(cx))
             .child(
                 div()
                     .h(px(54.))
@@ -507,13 +605,125 @@ impl MailApp {
                         .child(error),
                 )
             })
+            .into_any_element()
+    }
+
+    fn render_search_results(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let query = self.search_query.trim().to_owned();
+        let mut rows = div()
+            .id("search-results")
+            .h_full()
+            .flex_1()
+            .overflow_y_scroll();
+        for hit in &self.search_results {
+            let message_id = hit.id;
+            let mailbox_id = hit.mailbox_id;
+            let subject = nonempty_label(&hit.subject, "（无主题）");
+            let sender = nonempty_label(&hit.sender, "未知发件人");
+            let snippet = hit.snippet.as_str();
+            rows = rows.child(
+                div()
+                    .id((
+                        "search-result",
+                        u64::try_from(message_id).unwrap_or_default(),
+                    ))
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.raised))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_mailbox(mailbox_id, false, cx);
+                        this.select_message(message_id, cx);
+                    }))
+                    .child(highlighted_text(theme, &sender, &query, true))
+                    .child(highlighted_text(theme, &subject, &query, false))
+                    .child(highlighted_text(theme, snippet, &query, false)),
+            );
+        }
+        let count = self.search_results.len();
+        let status = search_status(count, self.search_error.as_deref());
+        div()
+            .h_full()
+            .w(relative(0.18))
+            .min_w(px(220.))
+            .flex_shrink_0()
+            .bg(theme.surface)
+            .border_r_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .child(self.render_search_bar(cx))
+            .child(
+                div()
+                    .h(px(54.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .text_sm()
+                            .child(SharedString::from(format!("搜索：{}", query))),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.text_tertiary)
+                            .text_xs()
+                            .child(SharedString::from(status)),
+                    ),
+            )
+            .child(rows)
+            .into_any_element()
+    }
+
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let value = if self.search_query.is_empty() {
+            "搜索邮件…".to_owned()
+        } else {
+            self.search_query.clone()
+        };
+        div()
+            .id("search-input")
+            .mx_3()
+            .mt_3()
+            .h(px(32.))
+            .px_3()
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .bg(theme.raised)
+            .text_color(if self.search_query.is_empty() {
+                theme.text_tertiary
+            } else {
+                theme.text
+            })
+            .text_xs()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.search_focus, cx);
+                }),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                window.focus(&this.search_focus, cx);
+            }))
+            .child(SharedString::from(value))
     }
 
     fn render_reader(&self) -> impl IntoElement {
         let theme = self.theme;
         let mut reader = div()
             .h_full()
-            .min_w_0()
+            .min_w(px(300.))
             .flex_1()
             .bg(theme.canvas)
             .flex()
@@ -558,7 +768,11 @@ impl MailApp {
                             detail.attachment_load_error.as_deref(),
                         )),
                 )
-                .child(render_plain_body(theme, &detail.body));
+                .child(render_plain_body(
+                    theme,
+                    preferred_body(&detail.body, &detail.html_body),
+                    &self.body_scroll,
+                ));
         } else if let Some(error) = &self.detail_load_error {
             reader = reader.child(
                 div()
@@ -596,6 +810,8 @@ impl Render for MailApp {
             .bg(self.theme.canvas)
             .text_color(self.theme.text)
             .flex()
+            .track_focus(&self.search_focus)
+            .on_key_down(cx.listener(Self::handle_search_key))
             .child(self.render_sidebar(cx))
             .child(self.render_message_list(cx))
             .child(self.render_reader())
@@ -629,6 +845,14 @@ fn mailbox_label(source_name: &str, display_name: &str) -> String {
     }
 }
 
+fn search_status(count: usize, error: Option<&str>) -> String {
+    match (error, count) {
+        (Some(error), _) => error.to_owned(),
+        (None, 0) => "未找到匹配邮件".to_owned(),
+        (None, count) => format!("{} 条结果", count),
+    }
+}
+
 fn detail_row(theme: Theme, label: &'static str, value: String) -> impl IntoElement {
     div()
         .mt_3()
@@ -655,8 +879,82 @@ fn detail_row(theme: Theme, label: &'static str, value: String) -> impl IntoElem
         )
 }
 
-fn render_plain_body(theme: Theme, value: &str) -> impl IntoElement {
-    let body = normalize_plain_body(value);
+fn highlighted_text(theme: Theme, value: &str, query: &str, secondary: bool) -> impl IntoElement {
+    let mut element = div()
+        .w_full()
+        .min_w_0()
+        .truncate()
+        .flex()
+        .text_color(if secondary {
+            theme.text_secondary
+        } else {
+            theme.text
+        })
+        .text_xs();
+    let mut cursor = 0;
+    for (start, end) in case_insensitive_match_ranges(value, query) {
+        if start > cursor {
+            element = element.child(SharedString::from(value[cursor..start].to_owned()));
+        }
+        element = element.child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme.accent)
+                .child(SharedString::from(value[start..end].to_owned())),
+        );
+        cursor = end;
+    }
+    if cursor < value.len() {
+        element = element.child(SharedString::from(value[cursor..].to_owned()));
+    }
+    element
+}
+
+fn case_insensitive_match_ranges(value: &str, query: &str) -> Vec<(usize, usize)> {
+    let query_chars = query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<Vec<_>>();
+    if query_chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lowered = Vec::new();
+    for (start, character) in value.char_indices() {
+        let end = start + character.len_utf8();
+        lowered.extend(
+            character
+                .to_lowercase()
+                .map(|lowered_character| (lowered_character, start, end)),
+        );
+    }
+
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index + query_chars.len() <= lowered.len() {
+        let matches = lowered[index..index + query_chars.len()]
+            .iter()
+            .zip(&query_chars)
+            .all(|((value_character, _, _), query_character)| value_character == query_character);
+        if matches {
+            let start = lowered[index].1;
+            let end = lowered[index + query_chars.len() - 1].2;
+            if ranges
+                .last()
+                .is_none_or(|(_, previous_end)| start >= *previous_end)
+            {
+                ranges.push((start, end));
+            }
+            index += query_chars.len();
+        } else {
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn render_plain_body(theme: Theme, value: String, scroll: &ScrollHandle) -> impl IntoElement {
+    let body = normalize_plain_body(&value);
     let empty = body.is_empty();
     let text = if empty {
         "正文为空".to_owned()
@@ -670,6 +968,7 @@ fn render_plain_body(theme: Theme, value: &str) -> impl IntoElement {
         .min_h_0()
         .min_w_0()
         .overflow_y_scroll()
+        .track_scroll(scroll)
         .px_6()
         .py_5()
         .text_color(if empty {
@@ -680,6 +979,179 @@ fn render_plain_body(theme: Theme, value: &str) -> impl IntoElement {
         .text_sm()
         .line_height(px(22.))
         .child(SharedString::from(text))
+}
+
+fn preferred_body(plain_body: &str, html_body: &str) -> String {
+    if !plain_body.trim().is_empty() {
+        return normalize_plain_body(plain_body);
+    }
+
+    sanitize_html_to_text(html_body)
+}
+
+fn sanitize_html_to_text(value: &str) -> String {
+    const BLOCK_TAGS: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ];
+    const VOID_TAGS: &[&str] = &["br", "hr"];
+    const BLOCKED_TAGS: &[&str] = &[
+        "applet", "embed", "iframe", "object", "script", "style", "svg", "template",
+    ];
+
+    let mut output = String::new();
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let Some(relative_start) = value[cursor..].find('<') else {
+            append_decoded_text(&mut output, &value[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        append_decoded_text(&mut output, &value[cursor..start]);
+
+        if value[start..].starts_with("<!--") {
+            let Some(relative_end) = value[start + 4..].find("-->") else {
+                break;
+            };
+            cursor = start + 4 + relative_end + 3;
+            continue;
+        }
+
+        let Some(end) = find_tag_end(value, start + 1) else {
+            append_decoded_text(&mut output, &value[start..]);
+            break;
+        };
+        let raw_tag = value[start + 1..end].trim();
+        let closing = raw_tag.starts_with('/');
+        let tag = raw_tag
+            .trim_start_matches('/')
+            .trim_start_matches('!')
+            .trim_start_matches('?')
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let tag = tag
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
+
+        if BLOCKED_TAGS.contains(&tag.as_str()) {
+            if !closing {
+                let closing_marker = format!("</{tag}");
+                if let Some(relative_close) =
+                    value[end + 1..].to_ascii_lowercase().find(&closing_marker)
+                {
+                    cursor = end + 1 + relative_close;
+                    continue;
+                }
+                break;
+            }
+        } else if VOID_TAGS.contains(&tag.as_str()) || BLOCK_TAGS.contains(&tag.as_str()) {
+            push_newline(&mut output);
+        }
+
+        cursor = end + 1;
+    }
+
+    normalize_plain_body(&output)
+}
+
+fn find_tag_end(value: &str, mut cursor: usize) -> Option<usize> {
+    let mut quote = None;
+    while cursor < value.len() {
+        let character = value[cursor..].chars().next()?;
+        cursor += character.len_utf8();
+        match (quote, character) {
+            (Some(expected), current) if expected == current => quote = None,
+            (None, '\'') | (None, '"') => quote = Some(character),
+            (None, '>') => return Some(cursor - 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn append_decoded_text(output: &mut String, text: &str) {
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(relative_start) = text[cursor..].find('&') else {
+            output.push_str(&text[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&text[cursor..start]);
+        let Some(relative_end) = text[start..].find(';') else {
+            output.push('&');
+            cursor = start + 1;
+            continue;
+        };
+        let end = start + relative_end;
+        let entity = &text[start + 1..end];
+        if let Some(decoded) = decode_entity(entity) {
+            output.push(decoded);
+            cursor = end + 1;
+        } else {
+            output.push('&');
+            cursor = start + 1;
+        }
+    }
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity.to_ascii_lowercase().as_str() {
+        "amp" => Some('&'),
+        "apos" => Some('\''),
+        "gt" => Some('>'),
+        "lt" => Some('<'),
+        "nbsp" => Some(' '),
+        "quot" => Some('"'),
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            u32::from_str_radix(&entity[2..], 16)
+                .ok()
+                .and_then(char::from_u32)
+        }
+        _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
+        _ => None,
+    }
+}
+
+fn push_newline(output: &mut String) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
 }
 
 fn render_attachment_list(
@@ -799,8 +1271,9 @@ fn compact_date(value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_date, format_bytes, mailbox_label, nonempty_label, normalize_plain_body,
-        resolve_index_path,
+        case_insensitive_match_ranges, compact_date, format_bytes, mailbox_label, nonempty_label,
+        normalize_plain_body, preferred_body, resolve_index_path, sanitize_html_to_text,
+        search_status,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -856,5 +1329,58 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1536), "1.5 KiB");
         assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn finds_case_insensitive_highlights_on_utf8_boundaries() {
+        assert_eq!(
+            case_insensitive_match_ranges("Request REQUEST", "request"),
+            vec![(0, 7), (8, 15)]
+        );
+        assert_eq!(case_insensitive_match_ranges("İstanbul", "i"), vec![(0, 2)]);
+        assert_eq!(
+            case_insensitive_match_ranges("中文主题", "中文"),
+            vec![(0, 6)]
+        );
+    }
+
+    #[test]
+    fn reports_search_empty_error_and_result_states() {
+        assert_eq!(search_status(0, None), "未找到匹配邮件");
+        assert_eq!(search_status(0, Some("索引损坏")), "索引损坏");
+        assert_eq!(search_status(2, None), "2 条结果");
+    }
+
+    #[test]
+    fn renders_safe_html_as_text_and_preserves_basic_structure() {
+        assert_eq!(
+            sanitize_html_to_text(
+                "<h1>标题</h1><p>第一行<br>第二行 &amp; &#x4E2D;</p><ul><li>项目</li></ul>"
+            ),
+            "标题\n第一行\n第二行 & 中\n项目"
+        );
+    }
+
+    #[test]
+    fn drops_active_html_content_attributes_and_resources() {
+        let rendered = sanitize_html_to_text(
+            "<p onclick=alert(1)>正文</p><script>alert(2)</script><style>body{color:red}</style>\
+             <iframe src='https://evil.test'>外部内容</iframe><img src='https://evil.test/x' alt='图片'>\
+             <a href='javascript:alert(3)'>安全链接文本</a>",
+        );
+        assert_eq!(rendered, "正文\n安全链接文本");
+        assert!(!rendered.contains("alert"));
+        assert!(!rendered.contains("evil.test"));
+    }
+
+    #[test]
+    fn falls_back_to_plain_body_when_html_has_no_displayable_text() {
+        assert_eq!(
+            preferred_body("纯文本正文", "<p>HTML 正文</p>"),
+            "纯文本正文"
+        );
+        assert_eq!(preferred_body("", "<p>HTML 正文</p>"), "HTML 正文");
+        assert_eq!(preferred_body("", "<script>secret()</script>"), "");
+        assert_eq!(preferred_body("纯文本正文", ""), "纯文本正文");
     }
 }
