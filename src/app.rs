@@ -8,10 +8,13 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
 };
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::ops::Range;
-use std::path::PathBuf;
 
+use crate::diagnostics::{
+    classify_index_error, index_message, log_index_problem, with_log_failure, with_log_path,
+    IndexProblem,
+};
+use crate::paths::{index_is_missing, AppPaths};
 use crate::theme::Theme;
 
 const MESSAGE_PAGE_SIZE: usize = 50;
@@ -34,27 +37,44 @@ pub struct MailApp {
     search_results: Vec<SearchHit>,
     search_error: Option<SharedString>,
     search_focus: FocusHandle,
+    paths: AppPaths,
 }
 
 impl MailApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let index_path = index_path();
-        let result = if index_path.is_file() {
-            MailStore::open_read_only(&index_path).and_then(|store| {
-                let accounts = store.mailbox_tree()?;
-                Ok((store, accounts))
-            })
-        } else {
-            Err(format!("邮件索引不存在：{}", index_path.display()).into())
-        };
-
-        let (store, accounts, load_error) = match result {
-            Ok((store, accounts)) => (Some(store), accounts, None),
-            Err(error) => (
+        let paths = AppPaths::resolve();
+        let _ = crate::diagnostics::log_startup(&paths.log, paths.index_source.as_str());
+        let (store, accounts, load_error) = if index_is_missing(&paths.index) {
+            let problem = IndexProblem::Missing;
+            (
                 None,
                 Vec::new(),
-                Some(SharedString::from(error.to_string())),
-            ),
+                Some(index_problem_message(
+                    &paths,
+                    "index_missing",
+                    problem,
+                    None,
+                    "打开邮件索引",
+                )),
+            )
+        } else {
+            match MailStore::open_read_only(&paths.index).and_then(|store| {
+                let accounts = store.mailbox_tree()?;
+                Ok((store, accounts))
+            }) {
+                Ok((store, accounts)) => (Some(store), accounts, None),
+                Err(error) => {
+                    let problem = classify_index_error(error.as_ref());
+                    let message = index_problem_message(
+                        &paths,
+                        "index_open_failed",
+                        problem,
+                        Some(error.as_ref()),
+                        "读取邮箱列表",
+                    );
+                    (None, Vec::new(), Some(message))
+                }
+            }
         };
         let selected_mailbox = accounts
             .iter()
@@ -80,6 +100,7 @@ impl MailApp {
             search_results: Vec::new(),
             search_error: None,
             search_focus: cx.focus_handle(),
+            paths,
         }
     }
 
@@ -182,8 +203,15 @@ impl MailApp {
                 self.search_error = None;
             }
             Err(error) => {
+                let problem = classify_index_error(error.as_ref());
                 self.search_results.clear();
-                self.search_error = Some(SharedString::from(error.to_string()));
+                self.search_error = Some(index_problem_message(
+                    &self.paths,
+                    "search_failed",
+                    problem,
+                    Some(error.as_ref()),
+                    "搜索邮件",
+                ));
             }
         }
     }
@@ -206,7 +234,14 @@ impl MailApp {
                 self.detail_load_error = Some("邮件已不存在，请重新生成索引".into());
             }
             Some(Err(error)) => {
-                self.detail_load_error = Some(SharedString::from(error.to_string()));
+                let problem = classify_index_error(error.as_ref());
+                self.detail_load_error = Some(index_problem_message(
+                    &self.paths,
+                    "message_detail_failed",
+                    problem,
+                    Some(error.as_ref()),
+                    "读取邮件详情",
+                ));
             }
             None => {
                 self.selected_message = None;
@@ -359,17 +394,17 @@ impl MailApp {
             }
         }
 
-        if let Some(error) = &self.load_error {
+        if self.load_error.is_some() {
             tree = tree.child(
                 div()
-                    .mx_4()
                     .mt_4()
-                    .p_3()
+                    .px_4()
+                    .py_3()
                     .rounded(px(4.))
                     .bg(theme.raised)
                     .text_color(theme.text_secondary)
                     .text_xs()
-                    .child(error.clone()),
+                    .child("索引不可用，请查看右侧说明"),
             );
         } else if self.accounts.is_empty() {
             tree = tree.child(
@@ -432,7 +467,14 @@ impl MailApp {
                 self.message_pages.insert(page_index, messages);
             }
             Err(error) => {
-                self.message_load_error = Some(SharedString::from(error.to_string()));
+                let problem = classify_index_error(error.as_ref());
+                self.message_load_error = Some(index_problem_message(
+                    &self.paths,
+                    "message_page_failed",
+                    problem,
+                    Some(error.as_ref()),
+                    "读取邮件列表",
+                ));
             }
         }
     }
@@ -643,6 +685,23 @@ impl MailApp {
                     .child(highlighted_text(theme, snippet, &query, false)),
             );
         }
+        if let Some(error) = &self.search_error {
+            rows = rows.child(
+                div()
+                    .mx_4()
+                    .mt_4()
+                    .p_3()
+                    .w_full()
+                    .min_w_0()
+                    .rounded(px(4.))
+                    .bg(theme.raised)
+                    .whitespace_normal()
+                    .text_color(theme.text_secondary)
+                    .text_xs()
+                    .line_height(px(18.))
+                    .child(error.clone()),
+            );
+        }
         let count = self.search_results.len();
         let status = search_status(count, self.search_error.as_deref());
         div()
@@ -729,7 +788,30 @@ impl MailApp {
             .flex()
             .flex_col();
 
-        if let Some(detail) = &self.selected_detail {
+        if let Some(error) = &self.load_error {
+            reader = reader.child(
+                div()
+                    .id("startup-error")
+                    .flex_1()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_y_scroll()
+                    .px_10()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_color(theme.text_secondary)
+                            .text_sm()
+                            .line_height(px(22.))
+                            .child(error.clone()),
+                    ),
+            );
+        } else if let Some(detail) = &self.selected_detail {
             let subject = nonempty_label(&detail.subject, "（无主题）");
             let sender = nonempty_label(&detail.sender, "未知发件人");
             let recipients = nonempty_label(&detail.recipients, "未记录收件人");
@@ -818,22 +900,6 @@ impl Render for MailApp {
     }
 }
 
-fn index_path() -> PathBuf {
-    resolve_index_path(
-        std::env::var_os("FOXMAIL_INDEX_PATH"),
-        std::env::var_os("FOXMAIL_BACKUP_DIR"),
-    )
-}
-
-fn resolve_index_path(index: Option<OsString>, backup_root: Option<OsString>) -> PathBuf {
-    index.map(PathBuf::from).unwrap_or_else(|| {
-        backup_root
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("data"))
-            .join("mail-index.sqlite")
-    })
-}
-
 fn mailbox_label(source_name: &str, display_name: &str) -> String {
     match source_name.to_ascii_uppercase().as_str() {
         "INBOX" => "收件箱".to_owned(),
@@ -847,10 +913,25 @@ fn mailbox_label(source_name: &str, display_name: &str) -> String {
 
 fn search_status(count: usize, error: Option<&str>) -> String {
     match (error, count) {
-        (Some(error), _) => error.to_owned(),
+        (Some(_), _) => "搜索失败".to_owned(),
         (None, 0) => "未找到匹配邮件".to_owned(),
         (None, count) => format!("{} 条结果", count),
     }
+}
+
+fn index_problem_message(
+    paths: &AppPaths,
+    event: &str,
+    problem: IndexProblem,
+    error: Option<&(dyn std::error::Error + 'static)>,
+    operation: &str,
+) -> SharedString {
+    let message = index_message(problem, operation, &paths.index);
+    let message = match log_index_problem(&paths.log, event, problem, error) {
+        Ok(()) => with_log_path(message, paths.log_hint),
+        Err(_) => with_log_failure(message),
+    };
+    SharedString::from(message)
 }
 
 fn detail_row(theme: Theme, label: &'static str, value: String) -> impl IntoElement {
@@ -1272,36 +1353,14 @@ fn compact_date(value: Option<&str>) -> String {
 mod tests {
     use super::{
         case_insensitive_match_ranges, compact_date, format_bytes, mailbox_label, nonempty_label,
-        normalize_plain_body, preferred_body, resolve_index_path, sanitize_html_to_text,
-        search_status,
+        normalize_plain_body, preferred_body, sanitize_html_to_text, search_status,
     };
-    use std::ffi::OsString;
-    use std::path::PathBuf;
 
     #[test]
     fn localizes_standard_mailbox_names_without_overwriting_custom_names() {
         assert_eq!(mailbox_label("INBOX", "INBOX"), "收件箱");
         assert_eq!(mailbox_label("Sent Items", "Sent Items"), "已发送");
         assert_eq!(mailbox_label("&XfJT0ZAB-", "已发送"), "已发送");
-    }
-
-    #[test]
-    fn index_path_uses_explicit_index_then_configured_backup_root() {
-        assert_eq!(
-            resolve_index_path(
-                Some(OsString::from("custom.sqlite")),
-                Some(OsString::from("backup")),
-            ),
-            PathBuf::from("custom.sqlite")
-        );
-        assert_eq!(
-            resolve_index_path(None, Some(OsString::from("backup"))),
-            PathBuf::from("backup").join("mail-index.sqlite")
-        );
-        assert_eq!(
-            resolve_index_path(None, None),
-            PathBuf::from("data").join("mail-index.sqlite")
-        );
     }
 
     #[test]
@@ -1347,7 +1406,7 @@ mod tests {
     #[test]
     fn reports_search_empty_error_and_result_states() {
         assert_eq!(search_status(0, None), "未找到匹配邮件");
-        assert_eq!(search_status(0, Some("索引损坏")), "索引损坏");
+        assert_eq!(search_status(0, Some("索引损坏")), "搜索失败");
         assert_eq!(search_status(2, None), "2 条结果");
     }
 

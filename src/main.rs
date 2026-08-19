@@ -5,6 +5,8 @@ use gpui_platform::application;
 use std::time::Duration;
 
 mod app;
+mod diagnostics;
+mod paths;
 mod theme;
 
 fn main() {
