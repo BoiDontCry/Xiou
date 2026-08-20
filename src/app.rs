@@ -439,9 +439,37 @@ impl MailApp {
                     .child(div().text_color(theme.text).text_sm().child("邮箱"))
                     .child(
                         div()
-                            .text_color(theme.text_tertiary)
-                            .text_xs()
-                            .child(SharedString::from(total_messages.to_string())),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("compose-button")
+                                    .h(px(26.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(4.))
+                                    .bg(theme.accent)
+                                    .text_color(gpui::hsla(0., 0., 0., 1.))
+                                    .text_xs()
+                                    .child("写信")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|_this, _, _, cx| {
+                                            crate::compose_window::ComposeWindow::open(
+                                                crate::compose_window::ComposeKind::New,
+                                                cx,
+                                            );
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.text_tertiary)
+                                    .text_xs()
+                                    .child(SharedString::from(total_messages.to_string())),
+                            ),
                     ),
             )
             .child(tree)

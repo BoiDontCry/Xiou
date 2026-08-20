@@ -5,6 +5,8 @@ use gpui_platform::application;
 use std::time::Duration;
 
 mod app;
+mod compose_window;
+mod composer_editor;
 mod diagnostics;
 mod paths;
 mod theme;
