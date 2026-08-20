@@ -16,6 +16,7 @@
 - Added append-only release logs containing event names and numeric SQLite/I/O fingerprints only; message content, credentials, full email addresses, paths, and raw database errors are excluded.
 - Added portable path resolution: `FOXMAIL_INDEX_PATH`, then `FOXMAIL_BACKUP_DIR`, then an existing EXE-adjacent `data/mail-index.sqlite`, then `%LOCALAPPDATA%/foxmail-rs/data/mail-index.sqlite`.
 - Added an explicit fallback when the log cannot be written because its parent is unavailable or unwritable.
+- Added a reproducible Windows x64 ZIP packaging command with pinned Rust, MSVC, and Windows SDK versions, a path-remapped static-CRT release build, user instructions, and SHA-256 manifests.
 
 ### Changed
 
@@ -44,6 +45,8 @@
 - A 60-second real-index smoke run produced 118 responsive samples, opened its window in about 539ms, and exited cleanly. Peak working set was 66,215,936 bytes, so the original 60 MiB memory target is not yet met.
 - `git diff --check` and targeted secret scan passed. An initial all-target test run was blocked by a leftover `foxmail-rs` GUI process; after terminating that stale process, the complete gate passed normally.
 - R6/M4 diagnostics gates passed with 33 tests: real invalid-SQLite classification, directory/metadata-open handling, missing/query-failure messages, path priority/fallbacks, unwritable-log fallback, log location, and a reserved-address/credential non-disclosure fixture.
-- Current path-remapped isolated release is 10,956,800 bytes. Corrupt-index and real-index runs both opened responsive windows and exited with code 0; the corrupt-index log recorded only `NotADatabase(26)`, and the release binary scan found no build-user path or diagnostic test secrets.
+- Current explicit-x64, path-remapped static-CRT release is 11,136,512 bytes. Its dependency table contains no `VCRUNTIME140.dll`, and the release binary scan found no build-user path or diagnostic test secrets.
 - A 20-cycle real-input stability run repeatedly switched folder/message coordinates, edited/cleared search, and scrolled the reader; all 69 response samples passed and the process exited cleanly.
 - Fresh 2026-08-19 rebuilds did not reproduce the earlier 65 MiB artifact baseline: the current build peaked near 71.6 MiB and a clean `e6ff0f2` rebuild peaked near 106.9 MiB under the same script. This is recorded as a build/runtime baseline discrepancy, not evidence of sustained growth; GPUI profiling remains out of R6/M4 scope.
+- The final `foxmail-rs-0.1.0-windows-x64.zip` is 4,905,912 bytes with SHA-256 `B72C359EF60B87F2105BBCBE9C7EAF29A9614B92899D37CC1C7CAA22997CF569`; a deliberately polluted environment and a normal environment produced the same hash with the pinned local toolchain and controlled release profile.
+- Clean extraction under a path containing spaces and Chinese characters passed user-data, portable-data, and unwritable-log scenarios. The packaged executable also passed 20/20 responsive auto-exit launches with no residual process.
