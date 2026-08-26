@@ -215,6 +215,16 @@ impl MailStore {
 
     pub fn search(&self, query: &str, limit: usize) -> StoreResult<Vec<SearchHit>> {
         let limit = i64::try_from(limit.min(1_000))?;
+        // ponytail: <3 字查询走 message 表 LIKE 全表扫描，大库会慢；
+        // 升级路径是 bigram 重建 FTS 索引。trigram 分词器对 <3 字查询切不出 trigram，只能兜底。
+        if query.chars().count() >= 3 {
+            self.search_fts(query, limit)
+        } else {
+            self.search_like(query, limit)
+        }
+    }
+
+    fn search_fts(&self, query: &str, limit: i64) -> StoreResult<Vec<SearchHit>> {
         let mut statement = self.connection.prepare(
             "SELECT m.id,
                     m.mailbox_id,
@@ -245,6 +255,44 @@ impl MailStore {
                 date_text: row.get(7)?,
                 snippet: row.get(8)?,
                 eml_path: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn search_like(&self, query: &str, limit: i64) -> StoreResult<Vec<SearchHit>> {
+        let pattern = format!("%{}%", escape_like_pattern(query));
+        let mut statement = self.connection.prepare(
+            "SELECT m.id,
+                    m.mailbox_id,
+                    mb.display_name,
+                    m.uid,
+                    m.subject,
+                    m.sender,
+                    m.recipients,
+                    m.date_text,
+                    m.eml_path
+             FROM message AS m
+             JOIN mailbox AS mb ON mb.id = m.mailbox_id
+             WHERE m.subject LIKE ?1 ESCAPE char(92) COLLATE NOCASE
+                OR m.sender LIKE ?1 ESCAPE char(92) COLLATE NOCASE
+                OR m.recipients LIKE ?1 ESCAPE char(92) COLLATE NOCASE
+                OR m.body LIKE ?1 ESCAPE char(92) COLLATE NOCASE
+             ORDER BY m.date_unix DESC, m.uid DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![pattern, limit], |row| {
+            Ok(SearchHit {
+                id: row.get(0)?,
+                mailbox_id: row.get(1)?,
+                mailbox: row.get(2)?,
+                uid: row.get(3)?,
+                subject: row.get(4)?,
+                sender: row.get(5)?,
+                recipients: row.get(6)?,
+                date_text: row.get(7)?,
+                snippet: String::new(),
+                eml_path: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -809,6 +857,21 @@ fn collect_bodies(mut count: usize, mut get: impl FnMut(usize) -> Option<String>
     bodies.join("\n\n")
 }
 
+/// Escape LIKE wildcards (`%` `_` `\`) so user input matches literally.
+fn escape_like_pattern(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 4);
+    for character in query.chars() {
+        match character {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(character);
+            }
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_attachment_metadata, MailStore};
@@ -867,12 +930,44 @@ Content-Transfer-Encoding: 8bit\r\n\
         assert_eq!(hits[0].mailbox, "台北");
         assert_eq!(hits[0].uid, 7);
         assert!(store.search("不存在的词", 10).unwrap().is_empty());
-        assert!(store.search("\"", 10).is_err());
+
+        // <3 字走 LIKE 兜底：trigram 切不出 trigram，LIKE 必须命中
+        let short = store.search("中文", 10).unwrap();
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].uid, 7);
+        assert!(short[0].snippet.is_empty()); // LIKE 路径无 snippet
+        assert!(store.search("不存", 10).unwrap().is_empty());
 
         let second = store.import_backup(&root).unwrap();
         assert_eq!(second.inserted, 0);
         assert_eq!(second.updated, 0);
         assert_eq!(second.skipped, 1);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn escapes_like_wildcards_in_short_queries() {
+        let root = temporary_directory("like-escape");
+        write_mailbox(
+            &root,
+            "alpha@example.com",
+            "INBOX",
+            42,
+            100,
+            &[(7, "达标 0% 报告"), (8, "其余无关邮件")],
+        );
+        let database = root.join("mail.sqlite");
+        let mut store = MailStore::open(&database).unwrap();
+        store.import_backup(&root).unwrap();
+
+        // `0%` 是 2 字走 LIKE 路径：`%` 必须转义为字面量，否则当通配符会误命中所有含 0 的邮件
+        // 转义后只匹配字面 "0%"，不匹配 "其余无关邮件"
+        let hits = store.search("0%", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].subject.contains("0%"));
+        assert!(hits.iter().all(|h| h.subject.contains("0%")));
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

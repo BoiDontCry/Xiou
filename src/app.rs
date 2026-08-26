@@ -887,21 +887,12 @@ impl MailApp {
             .mx_3()
             .mt_3()
             .h(px(36.))
-            .px_2()
+            .px_3()
             .flex()
             .items_center()
-            .gap_1()
             .rounded(px(4.))
             .bg(theme.raised)
             .when(focused, |el| el.border_1().border_color(theme.accent))
-            .child(
-                div()
-                    .w(px(18.))
-                    .flex_shrink_0()
-                    .text_color(theme.text_tertiary)
-                    .text_sm()
-                    .child("🔍"),
-            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |_this, _, window, cx| {
