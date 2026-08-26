@@ -1,6 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use gpui_platform::application;
 use std::time::Duration;
 
@@ -8,11 +8,30 @@ mod app;
 mod compose_window;
 mod composer_editor;
 mod diagnostics;
+mod draft_store;
 mod paths;
 mod theme;
 
 fn main() {
     application().run(|app: &mut App| {
+        app.bind_keys([
+            KeyBinding::new("backspace", composer_editor::Backspace, None),
+            KeyBinding::new("delete", composer_editor::Delete, None),
+            KeyBinding::new("left", composer_editor::Left, None),
+            KeyBinding::new("right", composer_editor::Right, None),
+            KeyBinding::new("up", composer_editor::Up, None),
+            KeyBinding::new("down", composer_editor::Down, None),
+            KeyBinding::new("shift-left", composer_editor::SelectLeft, None),
+            KeyBinding::new("shift-right", composer_editor::SelectRight, None),
+            KeyBinding::new("ctrl-a", composer_editor::SelectAll, None),
+            KeyBinding::new("ctrl-v", composer_editor::Paste, None),
+            KeyBinding::new("ctrl-c", composer_editor::Copy, None),
+            KeyBinding::new("ctrl-x", composer_editor::Cut, None),
+            KeyBinding::new("home", composer_editor::Home, None),
+            KeyBinding::new("end", composer_editor::End, None),
+            KeyBinding::new("enter", composer_editor::Newline, None),
+        ]);
+
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), app);
         app.open_window(
             WindowOptions {
@@ -24,7 +43,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_window, app| app.new(app::MailApp::new),
+            |window, app| app.new(|cx| app::MailApp::new(window, cx)),
         )
         .expect("failed to open Foxmail Reader window");
 

@@ -1,10 +1,11 @@
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     actions, div, fill, hsla, point, px, size, App, Bounds, ClipboardItem, Context, CursorStyle,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    Pixels, Point, Render, SharedString, Styled, StyledText, TextLayout, TextRun, UTF16Selection,
-    Window,
+    Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, TextLayout, TextRun, UTF16Selection, Window,
 };
 use std::ops::Range;
 use std::time::Duration;
@@ -38,25 +39,75 @@ pub enum ComposerEvent {
     Submit,
     Cancel,
     Edited,
+    NavigatePrevious,
+    NavigateNext,
+}
+
+#[derive(Clone)]
+pub struct ComposerInputOptions {
+    placeholder: SharedString,
+    single_line: bool,
+    submit_on_enter: bool,
+    list_navigation: bool,
+}
+
+impl ComposerInputOptions {
+    pub fn single_line(placeholder: impl Into<SharedString>) -> Self {
+        Self {
+            placeholder: placeholder.into(),
+            single_line: true,
+            submit_on_enter: false,
+            list_navigation: false,
+        }
+    }
+
+    pub fn multiline(placeholder: impl Into<SharedString>) -> Self {
+        Self {
+            placeholder: placeholder.into(),
+            single_line: false,
+            submit_on_enter: false,
+            list_navigation: false,
+        }
+    }
+
+    pub fn submit_on_enter(mut self) -> Self {
+        self.submit_on_enter = true;
+        self
+    }
+
+    pub fn list_navigation(mut self) -> Self {
+        self.list_navigation = true;
+        self
+    }
 }
 
 pub struct ComposerInput {
     focus_handle: FocusHandle,
     content: String,
     selected_range: Range<usize>,
+    marked_range: Option<Range<usize>>,
     selection_reversed: bool,
     is_selecting: bool,
     last_layout: Option<TextLayout>,
     cursor_visible: bool,
     cursor_epoch: usize,
+    scroll_handle: ScrollHandle,
+    placeholder: SharedString,
+    single_line: bool,
+    submit_on_enter: bool,
+    list_navigation: bool,
 }
 
 impl ComposerInput {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, initial: String) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        initial: String,
+        options: ComposerInputOptions,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let _ = cx.on_focus(&focus_handle, window, |this, _, cx| {
             this.cursor_epoch += 1;
-            this.cursor_visible = true;
             this.blink(this.cursor_epoch, cx);
             cx.notify();
         });
@@ -65,16 +116,36 @@ impl ComposerInput {
             this.cursor_visible = false;
             cx.notify();
         });
+        // ponytail: on_focus misses focus set during window construction (listener
+        // activates after the focus change). Window-activation catches it: when the
+        // window gains focus and we're already focused, start blinking. Mirrors waku.
+        let _ = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && this.focus_handle.is_focused(window) {
+                this.cursor_epoch += 1;
+                this.blink(this.cursor_epoch, cx);
+                cx.notify();
+            } else if !window.is_window_active() {
+                this.cursor_epoch += 1;
+                this.cursor_visible = false;
+                cx.notify();
+            }
+        });
         let offset = initial.len();
         Self {
             focus_handle,
             content: initial,
             selected_range: offset..offset,
+            marked_range: None,
             selection_reversed: false,
             is_selecting: false,
             last_layout: None,
-            cursor_visible: false,
+            cursor_visible: true,
             cursor_epoch: 0,
+            scroll_handle: ScrollHandle::new(),
+            placeholder: options.placeholder,
+            single_line: options.single_line,
+            submit_on_enter: options.submit_on_enter,
+            list_navigation: options.list_navigation,
         }
     }
 
@@ -82,11 +153,11 @@ impl ComposerInput {
         &self.content
     }
 
-    #[allow(dead_code)]
     pub fn set_content(&mut self, content: String, cx: &mut Context<Self>) {
         self.content = content;
         let offset = self.content.len();
         self.selected_range = offset..offset;
+        self.marked_range = None;
         self.selection_reversed = false;
         cx.emit(ComposerEvent::Edited);
         cx.notify();
@@ -248,6 +319,7 @@ impl ComposerInput {
         self.content = new;
         let offset = start + text.len();
         self.selected_range = offset..offset;
+        self.marked_range = None;
         self.selection_reversed = false;
         cx.emit(ComposerEvent::Edited);
         cx.notify();
@@ -296,11 +368,19 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.previous_line_start(self.cursor_offset()), cx);
+        if self.list_navigation && self.marked_range.is_none() {
+            cx.emit(ComposerEvent::NavigatePrevious);
+        } else {
+            self.move_to(self.previous_line_start(self.cursor_offset()), cx);
+        }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.next_line_start(self.cursor_offset()), cx);
+        if self.list_navigation && self.marked_range.is_none() {
+            cx.emit(ComposerEvent::NavigateNext);
+        } else {
+            self.move_to(self.next_line_start(self.cursor_offset()), cx);
+        }
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -330,11 +410,15 @@ impl ComposerInput {
     }
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        self.splice(self.selected_range.clone(), "\n", cx);
+        if !self.single_line {
+            self.splice(self.selected_range.clone(), "\n", cx);
+        }
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        self.splice(self.selected_range.clone(), "\n", cx);
+        if !self.single_line {
+            self.splice(self.selected_range.clone(), "\n", cx);
+        }
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
@@ -344,7 +428,7 @@ impl ComposerInput {
         let Some(text) = clipboard.text() else {
             return;
         };
-        let text = text.replace('\r', "");
+        let text = normalize_pasted_text(&text, self.single_line);
         self.splice(self.selected_range.clone(), &text, cx);
     }
 
@@ -367,7 +451,19 @@ impl ComposerInput {
         self.splice(self.selected_range.clone(), "", cx);
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        // ponytail: on_focus misses focus set during window construction, and
+        // observe_window_activation only fires on activation change. A click is
+        // the one guaranteed signal the user wants this field, so start blinking here.
+        self.cursor_epoch += 1;
+        self.cursor_visible = true;
+        self.blink(self.cursor_epoch, cx);
         self.is_selecting = true;
         let offset = self.index_for_position(event.position);
         if event.modifiers.shift {
@@ -410,7 +506,10 @@ impl Render for ComposerInput {
         let on_key = cx.listener(|this, event: &KeyDownEvent, _window, cx| {
             let modifiers = &event.keystroke.modifiers;
             let key = event.keystroke.key.as_str();
-            if key.eq_ignore_ascii_case("enter") && (modifiers.control || modifiers.platform) {
+            if key.eq_ignore_ascii_case("enter")
+                && this.marked_range.is_none()
+                && (modifiers.control || modifiers.platform || this.submit_on_enter)
+            {
                 this.dispatch_submit(true, false, cx);
             } else if key.eq_ignore_ascii_case("escape") {
                 this.dispatch_submit(false, true, cx);
@@ -424,8 +523,16 @@ impl Render for ComposerInput {
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
             .flex_1()
-            .min_h(px(24.0))
+            .min_h_0()
+            .min_h(if self.single_line { px(24.0) } else { px(96.0) })
             .w_full()
+            .when(self.single_line, |element| element.px_1())
+            .when(!self.single_line, |element| {
+                element
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .p_3()
+            })
             .text_color(theme.text)
             .text_sm()
             .line_height(px(22.0))
@@ -449,12 +556,18 @@ impl Render for ComposerInput {
             .on_mouse_down(MouseButton::Left, cx.listener(ComposerInput::on_mouse_down))
             .on_mouse_move(cx.listener(ComposerInput::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(ComposerInput::on_mouse_up))
-            .child(ComposerElement { input: cx.entity() })
+            .child(ComposerElement {
+                input: cx.entity(),
+                styled: None,
+            })
     }
 }
 
 struct ComposerElement {
     input: Entity<ComposerInput>,
+    // ponytail: reuse one StyledText across request_layout/prepaint/paint;
+    // rebuilding it per phase gives each phase a fresh unmeasured TextLayout → panic.
+    styled: Option<StyledText>,
 }
 
 impl IntoElement for ComposerElement {
@@ -483,40 +596,9 @@ impl Element for ComposerElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let input = self.input.read(cx);
-        let content_empty = input.content.is_empty();
-        let text: SharedString = if content_empty {
-            "在这里输入邮件正文…".into()
-        } else {
-            input.content.clone().into()
-        };
-        let style = window.text_style();
-        let run = if content_empty {
-            TextRun {
-                len: text.len(),
-                font: style.font(),
-                color: Theme::dark().text_tertiary,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            }
-        } else {
-            TextRun {
-                len: text.len(),
-                font: style.font(),
-                color: style.color,
-                background_color: if !input.selected_range.is_empty() {
-                    Some(hsla(0.0, 0.0, 1.0, 0.18))
-                } else {
-                    None
-                },
-                underline: None,
-                strikethrough: None,
-            }
-        };
-        let mut styled = StyledText::new(text).with_runs(vec![run]);
-        let (layout_id, ()) = styled.request_layout(None, None, window, cx);
-        (layout_id, ())
+        self.styled = Some(build_styled_text(self.input.read(cx), window));
+        let styled = self.styled.as_mut().expect("styled text built above");
+        styled.request_layout(None, None, window, cx)
     }
 
     fn prepaint(
@@ -528,60 +610,22 @@ impl Element for ComposerElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (text, run, cursor_offset, cursor_visible, selected_empty, content_empty) = {
-            let input = self.input.read(cx);
-            let content_empty = input.content.is_empty();
-            let text: SharedString = if content_empty {
-                "在这里输入邮件正文…".into()
-            } else {
-                input.content.clone().into()
-            };
-            let style = window.text_style();
-            let run = if content_empty {
-                TextRun {
-                    len: text.len(),
-                    font: style.font(),
-                    color: Theme::dark().text_tertiary,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }
-            } else {
-                TextRun {
-                    len: text.len(),
-                    font: style.font(),
-                    color: style.color,
-                    background_color: if !input.selected_range.is_empty() {
-                        Some(hsla(0.0, 0.0, 1.0, 0.18))
-                    } else {
-                        None
-                    },
-                    underline: None,
-                    strikethrough: None,
-                }
-            };
-            (
-                text,
-                run,
-                input.cursor_offset(),
-                input.cursor_visible,
-                input.selected_range.is_empty(),
-                content_empty,
-            )
-        };
-        let mut styled = StyledText::new(text).with_runs(vec![run]);
+        let styled = self.styled.as_mut().expect("request_layout ran first");
         styled.prepaint(None, None, bounds, &mut (), window, cx);
         let layout = styled.layout().clone();
-        let cursor = if !content_empty && selected_empty && cursor_visible {
-            layout.position_for_index(cursor_offset).map(|position| {
+        let input = self.input.read(cx);
+        // ponytail: cursor visible only when focused AND blink tick is on,
+        // mirroring waku's cursor_should_be_visible. blink is started by on_focus.
+        let cursor_visible = input.cursor_visible && input.focus_handle.is_focused(window);
+        let cursor = (input.selected_range.is_empty() && cursor_visible)
+            .then(|| layout.position_for_index(input.cursor_offset()))
+            .flatten()
+            .map(|position| {
                 fill(
                     Bounds::new(position, size(px(1.5), layout.line_height())),
                     Theme::dark().accent,
                 )
-            })
-        } else {
-            None
-        };
+            });
         self.input.update(cx, |input, _| {
             input.last_layout = Some(layout);
         });
@@ -604,51 +648,52 @@ impl Element for ComposerElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        let (text, run) = {
-            let input = self.input.read(cx);
-            let content_empty = input.content.is_empty();
-            let text: SharedString = if content_empty {
-                "在这里输入邮件正文…".into()
-            } else {
-                input.content.clone().into()
-            };
-            let style = window.text_style();
-            let run = if content_empty {
-                TextRun {
-                    len: text.len(),
-                    font: style.font(),
-                    color: Theme::dark().text_tertiary,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }
-            } else {
-                TextRun {
-                    len: text.len(),
-                    font: style.font(),
-                    color: style.color,
-                    background_color: if !input.selected_range.is_empty() {
-                        Some(hsla(0.0, 0.0, 1.0, 0.18))
-                    } else {
-                        None
-                    },
-                    underline: None,
-                    strikethrough: None,
-                }
-            };
-            (text, run)
-        };
-        let mut styled = StyledText::new(text).with_runs(vec![run]);
+        let styled = self.styled.as_mut().expect("request_layout ran first");
         styled.prepaint(None, None, bounds, &mut (), window, cx);
         styled.paint(None, None, bounds, &mut (), &mut (), window, cx);
-        let layout = styled.layout().clone();
         self.input.update(cx, |input, _| {
-            input.last_layout = Some(layout);
+            if let Some(styled) = self.styled.as_ref() {
+                input.last_layout = Some(styled.layout().clone());
+            }
         });
         if let Some(cursor) = prepaint.take() {
             window.paint_quad(cursor);
         }
     }
+}
+
+fn build_styled_text(input: &ComposerInput, window: &Window) -> StyledText {
+    let content_empty = input.content.is_empty();
+    let text: SharedString = if content_empty {
+        input.placeholder.clone()
+    } else {
+        input.content.clone().into()
+    };
+    let style = window.text_style();
+    let run = if content_empty {
+        TextRun {
+            len: text.len(),
+            font: style.font(),
+            color: Theme::dark().text_tertiary,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    } else {
+        TextRun {
+            len: text.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: if !input.selected_range.is_empty() {
+                Some(hsla(0.0, 0.0, 1.0, 0.18))
+            } else {
+                None
+            },
+            underline: None,
+            strikethrough: None,
+        }
+    };
+    StyledText::new(text).with_runs(vec![run])
 }
 
 impl EntityInputHandler for ComposerInput {
@@ -677,10 +722,14 @@ impl EntityInputHandler for ComposerInput {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.marked_range = None;
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -692,6 +741,7 @@ impl EntityInputHandler for ComposerInput {
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
+            .or(self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
         self.splice(range, text, cx);
     }
@@ -700,15 +750,38 @@ impl EntityInputHandler for ComposerInput {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        new_selected_range_utf16: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
+            .or(self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
-        self.splice(range, new_text, cx);
+        if !self.content.is_char_boundary(range.start)
+            || !self.content.is_char_boundary(range.end)
+            || range.start > range.end
+        {
+            return;
+        }
+        self.content.replace_range(range.clone(), new_text);
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        self.selected_range = new_selected_range_utf16
+            .as_ref()
+            .map(|selection| {
+                let start = utf8_offset_for_utf16(new_text, selection.start);
+                let end = utf8_offset_for_utf16(new_text, selection.end);
+                range.start + start..range.start + end
+            })
+            .unwrap_or_else(|| {
+                let offset = range.start + new_text.len();
+                offset..offset
+            });
+        self.selection_reversed = false;
+        cx.emit(ComposerEvent::Edited);
+        cx.notify();
     }
 
     fn bounds_for_range(
@@ -741,5 +814,45 @@ impl EntityInputHandler for ComposerInput {
             .unwrap_or_else(|index| index)
             .min(self.content.len());
         Some(self.offset_to_utf16(utf8_index))
+    }
+}
+
+fn utf8_offset_for_utf16(value: &str, utf16_target: usize) -> usize {
+    let mut utf16 = 0;
+    for (utf8, character) in value.char_indices() {
+        if utf16 >= utf16_target {
+            return utf8;
+        }
+        utf16 += character.len_utf16();
+    }
+    value.len()
+}
+
+fn normalize_pasted_text(value: &str, single_line: bool) -> String {
+    if single_line {
+        value.replace("\r\n", " ").replace(['\r', '\n'], " ")
+    } else {
+        value.replace('\r', "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_pasted_text, utf8_offset_for_utf16};
+
+    #[test]
+    fn converts_ime_selection_offsets_without_splitting_utf8() {
+        let value = "a中😀";
+        assert_eq!(utf8_offset_for_utf16(value, 0), 0);
+        assert_eq!(utf8_offset_for_utf16(value, 1), 1);
+        assert_eq!(utf8_offset_for_utf16(value, 2), 4);
+        assert_eq!(utf8_offset_for_utf16(value, 3), value.len());
+        assert_eq!(utf8_offset_for_utf16(value, 4), value.len());
+    }
+
+    #[test]
+    fn normalizes_paste_for_single_and_multiline_fields() {
+        assert_eq!(normalize_pasted_text("a\r\nb\nc", true), "a b c");
+        assert_eq!(normalize_pasted_text("a\r\nb\nc", false), "a\nb\nc");
     }
 }

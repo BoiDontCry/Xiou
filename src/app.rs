@@ -3,13 +3,15 @@ use foxmail_imap::mail_store::{
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, relative, uniform_list, AnyElement, Context, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    div, px, relative, uniform_list, AnyElement, AppContext, Context, Entity, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::time::Duration;
 
+use crate::composer_editor::{ComposerEvent, ComposerInput, ComposerInputOptions};
 use crate::diagnostics::{
     classify_index_error, index_message, log_index_problem, with_log_failure, with_log_path,
     IndexProblem,
@@ -36,12 +38,32 @@ pub struct MailApp {
     search_query: String,
     search_results: Vec<SearchHit>,
     search_error: Option<SharedString>,
-    search_focus: FocusHandle,
+    search_pending: bool,
+    search_selection: usize,
+    search_generation: usize,
+    search_input: Entity<ComposerInput>,
+    _search_subscription: gpui::Subscription,
     paths: AppPaths,
 }
 
 impl MailApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search_input = cx.new(|cx| {
+            ComposerInput::new(
+                window,
+                cx,
+                String::new(),
+                ComposerInputOptions::single_line("搜索邮件…")
+                    .submit_on_enter()
+                    .list_navigation(),
+            )
+        });
+        let search_subscription = cx.subscribe(
+            &search_input,
+            |this: &mut MailApp, _input, event: &ComposerEvent, cx| {
+                this.handle_search_event(event, cx)
+            },
+        );
         let paths = AppPaths::resolve();
         let _ = crate::diagnostics::log_startup(&paths.log, paths.index_source.as_str());
         let (store, accounts, load_error) = if index_is_missing(&paths.index) {
@@ -99,7 +121,11 @@ impl MailApp {
             search_query: String::new(),
             search_results: Vec::new(),
             search_error: None,
-            search_focus: cx.focus_handle(),
+            search_pending: false,
+            search_selection: 0,
+            search_generation: 0,
+            search_input,
+            _search_subscription: search_subscription,
             paths,
         }
     }
@@ -131,61 +157,105 @@ impl MailApp {
             }
         }
         if clear_search {
-            self.search_query.clear();
-            self.search_results.clear();
-            self.search_error = None;
+            self.clear_search(cx);
         }
         cx.notify();
     }
 
-    fn handle_search_key(
+    fn select_message_from_search(
         &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
+        mailbox_id: i64,
+        message_id: i64,
         cx: &mut Context<Self>,
     ) {
-        let key = event.keystroke.key.as_str();
-        if key.eq_ignore_ascii_case("escape") {
-            self.search_query.clear();
+        let mailbox_changed = self.selected_mailbox != Some(mailbox_id);
+        if mailbox_changed {
+            self.selected_mailbox = Some(mailbox_id);
+            self.message_pages.clear();
+            self.message_load_error = None;
+            self.selected_message = None;
+            self.selected_detail = None;
+            self.detail_load_error = None;
+            self.body_scroll.set_offset(Default::default());
+        }
+        self.select_message(message_id, cx);
+    }
+
+    fn handle_search_event(&mut self, event: &ComposerEvent, cx: &mut Context<Self>) {
+        match event {
+            ComposerEvent::Edited => self.search_edited(cx),
+            ComposerEvent::Submit => self.open_selected_search_result(cx),
+            ComposerEvent::Cancel => self.clear_search(cx),
+            ComposerEvent::NavigatePrevious => self.move_search_selection(false, cx),
+            ComposerEvent::NavigateNext => self.move_search_selection(true, cx),
+        }
+    }
+
+    fn search_edited(&mut self, cx: &mut Context<Self>) {
+        self.search_query = self.search_input.read(cx).content().to_owned();
+        self.search_selection = 0;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+
+        if self.search_query.trim().is_empty() {
             self.search_results.clear();
             self.search_error = None;
+            self.search_pending = false;
             cx.notify();
             return;
         }
-        if key.eq_ignore_ascii_case("backspace") {
-            self.search_query.pop();
-            self.run_search();
-            cx.notify();
-            return;
-        }
-        if key.eq_ignore_ascii_case("enter") {
-            if let Some(hit) = self.search_results.first().cloned() {
-                self.select_mailbox(hit.mailbox_id, false, cx);
-                self.select_message(hit.id, cx);
+
+        self.search_results.clear();
+        self.search_error = None;
+        self.search_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| {
+                    if this.search_generation == generation {
+                        this.run_search();
+                        cx.notify();
+                    }
+                });
             }
-            return;
-        }
-        if event.keystroke.modifiers.control
-            || event.keystroke.modifiers.alt
-            || event.keystroke.modifiers.platform
-        {
-            return;
-        }
-        let character = event
-            .keystroke
-            .key_char
-            .as_deref()
-            .or_else(|| (event.keystroke.key.chars().count() == 1).then_some(key));
-        let Some(character) = character else { return };
-        if character.chars().all(char::is_control) {
-            return;
-        }
-        self.search_query.push_str(character);
-        self.run_search();
+        })
+        .detach();
         cx.notify();
+    }
+
+    fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_error = None;
+        self.search_pending = false;
+        self.search_selection = 0;
+        if !self.search_input.read(cx).content().is_empty() {
+            self.search_input
+                .update(cx, |input, cx| input.set_content(String::new(), cx));
+        }
+        cx.notify();
+    }
+
+    fn move_search_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.search_results.len();
+        if count == 0 {
+            return;
+        }
+        self.search_selection = next_search_selection(self.search_selection, count, forward);
+        cx.notify();
+    }
+
+    fn open_selected_search_result(&mut self, cx: &mut Context<Self>) {
+        if let Some(hit) = self.search_results.get(self.search_selection).cloned() {
+            self.select_message_from_search(hit.mailbox_id, hit.id, cx);
+        }
     }
 
     fn run_search(&mut self) {
+        self.search_pending = false;
         let query = self.search_query.trim();
         if query.is_empty() {
             self.search_results.clear();
@@ -201,10 +271,14 @@ impl MailApp {
             Ok(results) => {
                 self.search_results = results;
                 self.search_error = None;
+                self.search_selection = self
+                    .search_selection
+                    .min(self.search_results.len().saturating_sub(1));
             }
             Err(error) => {
                 let problem = classify_index_error(error.as_ref());
                 self.search_results.clear();
+                self.search_selection = 0;
                 self.search_error = Some(index_problem_message(
                     &self.paths,
                     "search_failed",
@@ -601,10 +675,10 @@ impl MailApp {
             .collect()
     }
 
-    fn render_message_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_message_list(&mut self, cx: &mut Context<Self>, window: &Window) -> AnyElement {
         let theme = self.theme;
         if !self.search_query.trim().is_empty() {
-            return self.render_search_results(cx);
+            return self.render_search_results(cx, window);
         }
         let message_count = self.selected_count();
         let list = uniform_list(
@@ -626,7 +700,7 @@ impl MailApp {
             .border_color(theme.border)
             .flex()
             .flex_col()
-            .child(self.render_search_bar(cx))
+            .child(self.render_search_bar(cx, window))
             .child(
                 div()
                     .h(px(54.))
@@ -678,7 +752,7 @@ impl MailApp {
             .into_any_element()
     }
 
-    fn render_search_results(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_search_results(&mut self, cx: &mut Context<Self>, window: &Window) -> AnyElement {
         let theme = self.theme;
         let query = self.search_query.trim().to_owned();
         let mut rows = div()
@@ -686,9 +760,10 @@ impl MailApp {
             .h_full()
             .flex_1()
             .overflow_y_scroll();
-        for hit in &self.search_results {
+        for (index, hit) in self.search_results.iter().enumerate() {
             let message_id = hit.id;
             let mailbox_id = hit.mailbox_id;
+            let selected = index == self.search_selection;
             let subject = nonempty_label(&hit.subject, "（无主题）");
             let sender = nonempty_label(&hit.sender, "未知发件人");
             let snippet = hit.snippet.as_str();
@@ -700,14 +775,19 @@ impl MailApp {
                     ))
                     .px_4()
                     .py_3()
+                    .border_l_2()
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(if selected { theme.accent } else { theme.border })
+                    .when(selected, |style| style.bg(theme.raised))
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.raised))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_mailbox(mailbox_id, false, cx);
-                        this.select_message(message_id, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.search_selection = index;
+                            this.select_message_from_search(mailbox_id, message_id, cx);
+                        }),
+                    )
                     .child(highlighted_text(theme, &sender, &query, true))
                     .child(highlighted_text(theme, &subject, &query, false))
                     .child(highlighted_text(theme, snippet, &query, false)),
@@ -729,9 +809,35 @@ impl MailApp {
                     .line_height(px(18.))
                     .child(error.clone()),
             );
+        } else if self.search_results.is_empty() && !self.search_pending {
+            rows = rows.child(
+                div()
+                    .flex_1()
+                    .px_4()
+                    .py_8()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .text_color(theme.text_tertiary)
+                    .child(div().text_lg().child("🔍"))
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_color(theme.text_secondary)
+                            .text_sm()
+                            .child("未找到匹配邮件"),
+                    )
+                    .child(div().text_xs().child("换个关键词再试试")),
+            );
         }
         let count = self.search_results.len();
-        let status = search_status(count, self.search_error.as_deref());
+        let status = if self.search_pending {
+            "搜索中…".to_owned()
+        } else {
+            search_status(count, self.search_error.as_deref())
+        };
         div()
             .h_full()
             .w(relative(0.18))
@@ -742,7 +848,7 @@ impl MailApp {
             .border_color(theme.border)
             .flex()
             .flex_col()
-            .child(self.render_search_bar(cx))
+            .child(self.render_search_bar(cx, window))
             .child(
                 div()
                     .h(px(54.))
@@ -771,42 +877,65 @@ impl MailApp {
             .into_any_element()
     }
 
-    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_search_bar(&self, cx: &mut Context<Self>, window: &Window) -> impl IntoElement {
         let theme = self.theme;
-        let value = if self.search_query.is_empty() {
-            "搜索邮件…".to_owned()
-        } else {
-            self.search_query.clone()
-        };
+        let search_input = self.search_input.clone();
+        let focus_handle = search_input.read(cx).focus_handle();
+        let focused = focus_handle.is_focused(window);
         div()
             .id("search-input")
             .mx_3()
             .mt_3()
-            .h(px(32.))
-            .px_3()
+            .h(px(36.))
+            .px_2()
             .flex()
             .items_center()
+            .gap_1()
             .rounded(px(4.))
             .bg(theme.raised)
-            .text_color(if self.search_query.is_empty() {
-                theme.text_tertiary
-            } else {
-                theme.text
-            })
-            .text_xs()
+            .when(focused, |el| el.border_1().border_color(theme.accent))
+            .child(
+                div()
+                    .w(px(18.))
+                    .flex_shrink_0()
+                    .text_color(theme.text_tertiary)
+                    .text_sm()
+                    .child("🔍"),
+            )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    window.focus(&this.search_focus, cx);
+                cx.listener(move |_this, _, window, cx| {
+                    window.focus(&focus_handle, cx);
                 }),
             )
-            .on_click(cx.listener(|this, _, window, cx| {
-                window.focus(&this.search_focus, cx);
-            }))
-            .child(SharedString::from(value))
+            .child(div().flex_1().min_w_0().h_full().child(search_input))
+            .when(!self.search_query.is_empty(), |element| {
+                element.child(
+                    div()
+                        .id("clear-search")
+                        .size(px(24.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .text_color(theme.text_tertiary)
+                        .hover(|style| style.bg(theme.border).text_color(theme.text))
+                        .child("×")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.clear_search(cx);
+                                let focus = this.search_input.read(cx).focus_handle();
+                                window.focus(&focus, cx);
+                            }),
+                        ),
+                )
+            })
     }
 
-    fn render_reader(&self) -> impl IntoElement {
+    fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut reader = div()
             .h_full()
@@ -867,6 +996,56 @@ impl MailApp {
                                 .text_lg()
                                 .child(SharedString::from(subject)),
                         )
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("reply-button")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(4.))
+                                        .bg(theme.raised)
+                                        .text_color(theme.text_secondary)
+                                        .text_xs()
+                                        .child("回复")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let detail = detail.clone();
+                                                move |_this, _, _, cx| {
+                                                    crate::compose_window::ComposeWindow::reply(
+                                                        &detail, cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("forward-button")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(4.))
+                                        .bg(theme.raised)
+                                        .text_color(theme.text_secondary)
+                                        .text_xs()
+                                        .child("转发")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener({
+                                                let detail = detail.clone();
+                                                move |_this, _, _, cx| {
+                                                    crate::compose_window::ComposeWindow::forward(
+                                                        &detail, cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                ),
+                        )
                         .child(detail_row(theme, "发件人", sender))
                         .child(detail_row(theme, "收件人", recipients))
                         .child(detail_row(theme, "时间", date))
@@ -913,18 +1092,16 @@ impl MailApp {
 }
 
 impl Render for MailApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .overflow_hidden()
             .bg(self.theme.canvas)
             .text_color(self.theme.text)
             .flex()
-            .track_focus(&self.search_focus)
-            .on_key_down(cx.listener(Self::handle_search_key))
             .child(self.render_sidebar(cx))
-            .child(self.render_message_list(cx))
-            .child(self.render_reader())
+            .child(self.render_message_list(cx, window))
+            .child(self.render_reader(cx))
     }
 }
 
@@ -944,6 +1121,19 @@ fn search_status(count: usize, error: Option<&str>) -> String {
         (Some(_), _) => "搜索失败".to_owned(),
         (None, 0) => "未找到匹配邮件".to_owned(),
         (None, count) => format!("{} 条结果", count),
+    }
+}
+
+fn next_search_selection(current: usize, count: usize, forward: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % count
+    } else if current == 0 {
+        count - 1
+    } else {
+        current - 1
     }
 }
 
@@ -1380,8 +1570,9 @@ fn compact_date(value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_insensitive_match_ranges, compact_date, format_bytes, mailbox_label, nonempty_label,
-        normalize_plain_body, preferred_body, sanitize_html_to_text, search_status,
+        case_insensitive_match_ranges, compact_date, format_bytes, mailbox_label,
+        next_search_selection, nonempty_label, normalize_plain_body, preferred_body,
+        sanitize_html_to_text, search_status,
     };
 
     #[test]
@@ -1436,6 +1627,15 @@ mod tests {
         assert_eq!(search_status(0, None), "未找到匹配邮件");
         assert_eq!(search_status(0, Some("索引损坏")), "搜索失败");
         assert_eq!(search_status(2, None), "2 条结果");
+    }
+
+    #[test]
+    fn wraps_search_selection_in_both_directions() {
+        assert_eq!(next_search_selection(0, 3, true), 1);
+        assert_eq!(next_search_selection(2, 3, true), 0);
+        assert_eq!(next_search_selection(0, 3, false), 2);
+        assert_eq!(next_search_selection(2, 3, false), 1);
+        assert_eq!(next_search_selection(0, 0, true), 0);
     }
 
     #[test]
