@@ -297,7 +297,7 @@ impl MailApp {
                 return;
             }
         };
-        let output = self.backup_root_for(&account);
+        let backup_root = self.backup_root_for(&account);
         if let Err(error) = account_config::save(&account) {
             self.update_onboarding_error(
                 Some(SharedString::from(format!("保存账号配置失败：{error}"))),
@@ -310,6 +310,11 @@ impl MailApp {
         let port = account.port;
         let user = account.user.clone();
         let password = account.password.clone();
+        // 记住预期备份根目录，finish_sync 直接复用，避免重新读 DPAPI + safe_component
+        // 算的一致性（旧 last_backup_root 路径会报"未找到备份目录"）。
+        // 记住预期备份根目录，finish_sync 直接复用，避免 last_backup_root 依赖
+        // 重新读取 DPAPI + safe_component 算的一致性。须在线程 move user 之前算。
+        let expected_backup_root = backup_root.join(backup::safe_component(&user));
         self.sync = Some(SyncState::Connecting);
         self.onboarding = None;
         cx.notify();
@@ -319,7 +324,7 @@ impl MailApp {
         // 后台线程跑 IMAP 拉取；错误在线程内转 String 并发一个 Failed 事件后退出。
         // Box<dyn Error> 不跨线程，规避 Send 缺失；sender drop 让 pump 收尾。
         let options = BackupOptions {
-            output,
+            output: backup_root.clone(),
             mailbox: None,
             max_messages: None,
             chunk_size: backup::DEFAULT_CHUNK_SIZE,
@@ -337,19 +342,25 @@ impl MailApp {
         drop(progress_tx);
 
         cx.spawn(async move |this, cx| {
-            // ponytail: 单 receiver 留在本闭包，100ms try_recv 攒批 flush 给 UI；
-            // 全部 sender drop 后 try_recv 拿空且 is_empty 判定收尾。
+            // ponytail: 只在收到 Finished/Failed 终端事件时退出，绝不因"连续空轮"提前 break。
+            // 之前两轮空就退出 → 大附件慢下载间隙触发误退出，sync 停在中间态 →
+            // finish_sync 报"未找到备份目录"。空轮只意味着"无新数据，继续等"。
+            // 线程结束前必发 Finished（成功）或 send_failed（失败），故终会收到。
             let mut batch: Vec<backup::ProgressEvent> = Vec::new();
-            loop {
+            let mut finished = false;
+            while !finished {
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
-                // ponytail: Receiver 无 is_empty/len；用 try_recv 清空判定。
-                // sender 全部 drop 后 try_recv 返回 Err → 本轮无新增且上次也无 → 收尾。
-                let mut got_any = false;
                 while let Ok(event) = progress_rx.try_recv() {
+                    if matches!(
+                        event,
+                        backup::ProgressEvent::Finished { .. }
+                            | backup::ProgressEvent::Failed { .. }
+                    ) {
+                        finished = true;
+                    }
                     batch.push(event);
-                    got_any = true;
                 }
                 if !batch.is_empty() {
                     this.update(cx, |this, cx| {
@@ -360,30 +371,11 @@ impl MailApp {
                     })
                     .ok();
                 }
-                if !got_any {
-                    // 本轮无事件；若 channel 已关（sender drop），下一轮仍无 → 加一次确认后退出。
-                    // 用 same_consumer 不可行；直接判 try_recv 连续两轮空即退出。
-                    cx.background_executor()
-                        .timer(Duration::from_millis(100))
-                        .await;
-                    while let Ok(event) = progress_rx.try_recv() {
-                        batch.push(event);
-                        got_any = true;
-                    }
-                    if got_any {
-                        this.update(cx, |this, cx| {
-                            for event in batch.drain(..) {
-                                this.apply_progress(event);
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                        continue;
-                    }
-                    break;
-                }
             }
-            this.update(cx, |this, cx| this.finish_sync(cx)).ok();
+            this.update(cx, |this, cx| {
+                this.finish_sync_with(expected_backup_root, cx);
+            })
+            .ok();
         })
         .detach();
     }
@@ -483,21 +475,11 @@ impl MailApp {
         self.sync = Some(next);
     }
 
-    fn finish_sync(&mut self, cx: &mut Context<Self>) {
+    fn finish_sync_with(&mut self, backup_root: PathBuf, cx: &mut Context<Self>) {
         if matches!(self.sync.as_ref(), Some(SyncState::Failed(_))) {
             cx.notify();
             return;
         }
-        let backup_root = match self.last_backup_root() {
-            Some(root) => root,
-            None => {
-                self.sync = Some(SyncState::Failed(SharedString::from(
-                    "拉取完成但未找到备份目录",
-                )));
-                cx.notify();
-                return;
-            }
-        };
         let index_path = self.paths.index.clone();
         self.sync = Some(SyncState::Done {
             backed_up: 0,
@@ -574,21 +556,6 @@ impl MailApp {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("data"))
-    }
-
-    fn last_backup_root(&self) -> Option<PathBuf> {
-        // backup 落盘到 backup_root_for/<safe_component(user)>；复用 backup 的命名。
-        self.sync
-            .as_ref()
-            .and_then(|s| match s {
-                SyncState::Done { .. } => Some(()),
-                _ => None,
-            })
-            .and_then(|_| {
-                let account = account_config::load().ok().flatten()?;
-                let root = self.backup_root_for(&account);
-                Some(root.join(backup::safe_component(&account.user)))
-            })
     }
 
     fn render_onboarding_or_sync(
