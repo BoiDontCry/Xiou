@@ -45,6 +45,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
 ] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
 gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview" }
 gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = ["font-kit"] }
 

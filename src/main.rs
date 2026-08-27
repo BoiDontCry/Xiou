@@ -10,6 +10,7 @@ mod composer_editor;
 mod diagnostics;
 mod draft_store;
 mod paths;
+mod save_dialog;
 mod theme;
 
 fn main() {

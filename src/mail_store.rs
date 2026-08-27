@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -517,6 +518,27 @@ impl MailStore {
         }))
     }
 
+    pub fn save_attachment(
+        &self,
+        message_id: i64,
+        attachment_index: usize,
+        target_path: &Path,
+    ) -> StoreResult<()> {
+        let eml_path = self
+            .message_detail(message_id)?
+            .ok_or_else(|| format!("邮件不存在：id={message_id}"))?
+            .eml_path;
+        let attachment =
+            read_attachment_bytes(&self.resolve_source_path(&eml_path), attachment_index)?;
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::File::create(target_path)?;
+        file.write_all(&attachment)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     fn resolve_source_path(&self, stored_path: &str) -> PathBuf {
         let path = Path::new(stored_path);
         if path.is_absolute() {
@@ -551,6 +573,31 @@ fn source_root(database_path: &Path) -> Option<PathBuf> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
+}
+
+fn read_attachment_bytes(path: &Path, attachment_index: usize) -> StoreResult<Vec<u8>> {
+    let raw = fs::read(path)?;
+    let message = MessageParser::default()
+        .parse(&raw)
+        .ok_or_else(|| format!("无法解析 RFC822/MIME 邮件：{}", path.display()))?;
+    let part = message
+        .attachment(attachment_index)
+        .ok_or_else(|| format!("附件序号越界：index={attachment_index}"))?;
+
+    Ok(match &part.body {
+        mail_parser::PartType::Binary(bytes) | mail_parser::PartType::InlineBinary(bytes) => {
+            bytes.to_vec()
+        }
+        mail_parser::PartType::Text(text) | mail_parser::PartType::Html(text) => {
+            text.as_bytes().to_vec()
+        }
+        mail_parser::PartType::Message(nested) => nested.raw_message.to_vec(),
+        mail_parser::PartType::Multipart(_) => {
+            return Err(
+                format!("附件 index={attachment_index} 是 multipart 容器，无独立载荷").into(),
+            )
+        }
+    })
 }
 
 fn read_attachment_metadata(path: &Path) -> StoreResult<Vec<AttachmentMeta>> {
@@ -872,9 +919,39 @@ fn escape_like_pattern(query: &str) -> String {
     out
 }
 
+/// Sanitize a MIME-supplied filename into a safe single file component.
+///
+/// Strips path separators/drive prefixes (traversal), Windows-reserved names,
+/// and control characters; falls back to `attachment.bin`.
+pub fn sanitized_attachment_filename(filename: &str) -> String {
+    let name = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control() && *character != ':' && *character != '"')
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or_default();
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || RESERVED.contains(&stem.to_ascii_uppercase().as_str())
+    {
+        return "attachment.bin".to_owned();
+    }
+    name
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{read_attachment_metadata, MailStore};
+    use super::{read_attachment_metadata, sanitized_attachment_filename, MailStore};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1137,6 +1214,94 @@ AAE=\r\n\
         assert!(!attachments[0].inline);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saves_attachment_payload_to_target_path() {
+        let root = temporary_directory("attachment-save");
+        let mailbox = root
+            .join(fixture_component("user@example.com"))
+            .join(fixture_component("INBOX"))
+            .join("uidvalidity-42");
+        fs::create_dir_all(&mailbox).unwrap();
+        fs::write(
+            mailbox.join("mailbox.meta.json"),
+            serde_json::to_vec_pretty(&json!({
+                "account": "user@example.com",
+                "server": "imap.example.com",
+                "mailbox": "INBOX",
+                "uid_validity": 42,
+                "scanned_at_unix": 100,
+                "server_message_count": 1,
+                "discovered_uid_count": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // base64 "AAE=" decodes to bytes [0x00, 0x01]
+        fs::write(
+            mailbox.join("0000000001.eml"),
+            "From: sender@example.com\r\n\
+To: receiver@example.com\r\n\
+Date: Mon, 17 Aug 2026 09:00:00 +0800\r\n\
+Subject: Attachment save\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=foxmail-boundary\r\n\
+\r\n\
+--foxmail-boundary\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+hello\r\n\
+--foxmail-boundary\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=test.bin\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+AAE=\r\n\
+--foxmail-boundary--\r\n",
+        )
+        .unwrap();
+
+        let database = root.join("mail.sqlite");
+        let mut store = MailStore::open(&database).unwrap();
+        store.import_backup(&root).unwrap();
+        let mailbox_id = store.mailbox_tree().unwrap()[0].mailboxes[0].id;
+        let message_id = store.message_page(mailbox_id, 0, 10).unwrap()[0].id;
+
+        let target = root.join("out").join("saved.bin");
+        store.save_attachment(message_id, 0, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), vec![0x00, 0x01]);
+
+        drop(store);
+        // read-only path also saves attachments
+        let store = MailStore::open_read_only(&database).unwrap();
+        let target2 = root.join("out").join("saved2.bin");
+        store.save_attachment(message_id, 0, &target2).unwrap();
+        assert_eq!(fs::read(&target2).unwrap(), vec![0x00, 0x01]);
+
+        // out-of-range index must fail without creating the file
+        let missing = root.join("out").join("missing.bin");
+        assert!(store.save_attachment(message_id, 5, &missing).is_err());
+        assert!(!missing.exists());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sanitizes_mime_filenames_against_traversal_and_reserved_names() {
+        assert_eq!(sanitized_attachment_filename("../../evil.exe"), "evil.exe");
+        assert_eq!(sanitized_attachment_filename("C:\\temp\\x.pdf"), "x.pdf");
+        assert_eq!(sanitized_attachment_filename("a/b\\c.txt"), "c.txt");
+        assert_eq!(sanitized_attachment_filename("CON"), "attachment.bin");
+        assert_eq!(sanitized_attachment_filename("com1.zip"), "attachment.bin");
+        assert_eq!(sanitized_attachment_filename(".."), "attachment.bin");
+        assert_eq!(sanitized_attachment_filename(""), "attachment.bin");
+        assert_eq!(sanitized_attachment_filename(".hidden"), "attachment.bin");
+        assert_eq!(
+            sanitized_attachment_filename("报告\x08最终版.docx"),
+            "报告最终版.docx"
+        );
     }
 
     fn write_mailbox(

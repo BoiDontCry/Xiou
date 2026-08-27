@@ -1,5 +1,6 @@
 use foxmail_imap::mail_store::{
-    AttachmentMeta, MailStore, MailboxAccount, MessageDetail, MessageSummary, SearchHit,
+    sanitized_attachment_filename, AttachmentMeta, MailStore, MailboxAccount, MessageDetail,
+    MessageSummary, SearchHit,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -43,7 +44,14 @@ pub struct MailApp {
     search_generation: usize,
     search_input: Entity<ComposerInput>,
     _search_subscription: gpui::Subscription,
+    save_state: Option<SaveState>,
     paths: AppPaths,
+}
+
+enum SaveState {
+    Saving,
+    Done(SharedString),
+    Failed(SharedString),
 }
 
 impl MailApp {
@@ -126,8 +134,81 @@ impl MailApp {
             search_generation: 0,
             search_input,
             _search_subscription: search_subscription,
+            save_state: None,
             paths,
         }
+    }
+
+    fn start_attachment_save(
+        &mut self,
+        message_id: i64,
+        attachment_index: usize,
+        filename: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .save_state
+            .as_ref()
+            .is_some_and(|state| matches!(state, SaveState::Saving))
+        {
+            return;
+        }
+        let Some(_store) = self.store.as_ref() else {
+            self.save_state = Some(SaveState::Failed("邮件索引未打开".into()));
+            cx.notify();
+            return;
+        };
+        let Some(target) = crate::save_dialog::prompt_save_path(window, &filename) else {
+            return; // user cancelled
+        };
+        self.save_state = Some(SaveState::Saving);
+        cx.notify();
+        let display_name: SharedString = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.to_string_lossy().into_owned())
+            .into();
+        let task = cx.background_executor().spawn({
+            // ponytail: re-open a read-only handle on a background thread; rusqlite Connection
+            // isn't Clone+Send, so we reopen by path instead of cloning the live connection.
+            // Errors are stringified so the task stays Send (Box<dyn Error> is not Send).
+            let index_path = self.paths.index.clone();
+            async move {
+                let store =
+                    MailStore::open_read_only(&index_path).map_err(|error| error.to_string())?;
+                store
+                    .save_attachment(message_id, attachment_index, &target)
+                    .map_err(|error| error.to_string())
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.save_state = Some(match result {
+                    Ok(()) => SaveState::Done(display_name),
+                    Err(error) => {
+                        let message = index_problem_message(
+                            &this.paths,
+                            "attachment_save_failed",
+                            IndexProblem::QueryFailed,
+                            None,
+                            "保存附件",
+                        );
+                        let _ = log_index_problem(
+                            &this.paths.log,
+                            "attachment_save_failed",
+                            IndexProblem::QueryFailed,
+                            None,
+                        );
+                        SaveState::Failed(SharedString::from(format!("{message}：{error}")))
+                    }
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_account(&mut self, key: String, cx: &mut Context<Self>) {
@@ -150,6 +231,7 @@ impl MailApp {
             self.selected_message = None;
             self.selected_detail = None;
             self.detail_load_error = None;
+            self.save_state = None;
             self.body_scroll.set_offset(Default::default());
             if self.selected_count() > 0 {
                 self.message_scroll
@@ -298,6 +380,7 @@ impl MailApp {
         self.selected_message = Some(id);
         self.selected_detail = None;
         self.detail_load_error = None;
+        self.save_state = None;
         self.body_scroll.set_offset(Default::default());
         match self.store.as_ref().map(|store| store.message_detail(id)) {
             Some(Ok(Some(detail))) => {
@@ -926,7 +1009,7 @@ impl MailApp {
             })
     }
 
-    fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_reader(&self, cx: &mut Context<Self>, window: &Window) -> impl IntoElement {
         let theme = self.theme;
         let mut reader = div()
             .h_full()
@@ -1041,11 +1124,12 @@ impl MailApp {
                         .child(detail_row(theme, "收件人", recipients))
                         .child(detail_row(theme, "时间", date))
                         .child(detail_row(theme, "附件", attachments))
-                        .child(render_attachment_list(
-                            theme,
+                        .child(self.render_attachment_list(
                             &detail.attachments,
                             detail.attachment_count,
                             detail.attachment_load_error.as_deref(),
+                            window,
+                            cx,
                         )),
                 )
                 .child(render_plain_body(
@@ -1092,7 +1176,7 @@ impl Render for MailApp {
             .flex()
             .child(self.render_sidebar(cx))
             .child(self.render_message_list(cx, window))
-            .child(self.render_reader(cx))
+            .child(self.render_reader(cx, window))
     }
 }
 
@@ -1444,80 +1528,138 @@ fn push_newline(output: &mut String) {
     }
 }
 
-fn render_attachment_list(
-    theme: Theme,
-    attachments: &[AttachmentMeta],
-    attachment_count: usize,
-    load_error: Option<&str>,
-) -> impl IntoElement {
-    let mut section = div();
-    if attachment_count == 0 {
-        return section;
+impl MailApp {
+    fn render_attachment_list(
+        &self,
+        attachments: &[AttachmentMeta],
+        attachment_count: usize,
+        load_error: Option<&str>,
+        _window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let mut section = div();
+        if attachment_count == 0 {
+            return section;
+        }
+
+        section = section
+            .mt_4()
+            .pt_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .text_xs()
+                    .child(SharedString::from(format!("附件（{}）", attachment_count))),
+            );
+
+        if attachments.is_empty() {
+            return section.child(
+                div()
+                    .mt_2()
+                    .text_color(theme.text_tertiary)
+                    .text_xs()
+                    .child(if load_error.is_some() {
+                        "附件信息暂不可用"
+                    } else {
+                        "未解析到附件信息"
+                    }),
+            );
+        }
+
+        if let Some(state) = &self.save_state {
+            let text: SharedString = match state {
+                SaveState::Saving => "正在保存…".into(),
+                SaveState::Done(name) => format!("已保存：{name}").into(),
+                SaveState::Failed(error) => format!("保存失败：{error}").into(),
+            };
+            section = section.child(
+                div()
+                    .mt_2()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(match state {
+                        SaveState::Failed(_) => theme.accent,
+                        _ => theme.text_tertiary,
+                    })
+                    .child(text),
+            );
+        }
+
+        for (index, attachment) in attachments.iter().enumerate() {
+            let filename = nonempty_label(&attachment.filename, "未命名附件");
+            let marker = if attachment.inline {
+                "内嵌"
+            } else {
+                "附件"
+            };
+            let metadata = format!(
+                "{} · {} · {}",
+                marker,
+                attachment.content_type,
+                format_bytes(attachment.size_bytes)
+            );
+            let message_id = self.selected_message.unwrap_or_default();
+            let save_target = sanitized_attachment_filename(&attachment.filename);
+            section = section.child(
+                div()
+                    .mt_2()
+                    .min_w_0()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .text_sm()
+                                    .child(SharedString::from(filename)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text_tertiary)
+                                    .text_xs()
+                                    .child(SharedString::from(metadata)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("attachment-save", index))
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.))
+                            .bg(theme.raised)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.active))
+                            .text_color(theme.text_secondary)
+                            .text_xs()
+                            .child("保存")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.start_attachment_save(
+                                    message_id,
+                                    index,
+                                    save_target.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
+            );
+        }
+
+        section
     }
-
-    section = section
-        .mt_4()
-        .pt_3()
-        .border_t_1()
-        .border_color(theme.border)
-        .child(
-            div()
-                .text_color(theme.text_secondary)
-                .text_xs()
-                .child(SharedString::from(format!("附件（{}）", attachment_count))),
-        );
-
-    if attachments.is_empty() {
-        return section.child(
-            div()
-                .mt_2()
-                .text_color(theme.text_tertiary)
-                .text_xs()
-                .child(if load_error.is_some() {
-                    "附件信息暂不可用"
-                } else {
-                    "未解析到附件信息"
-                }),
-        );
-    }
-
-    for attachment in attachments {
-        let filename = nonempty_label(&attachment.filename, "未命名附件");
-        let marker = if attachment.inline {
-            "内嵌"
-        } else {
-            "附件"
-        };
-        let metadata = format!(
-            "{} · {} · {}",
-            marker,
-            attachment.content_type,
-            format_bytes(attachment.size_bytes)
-        );
-        section = section.child(
-            div()
-                .mt_2()
-                .min_w_0()
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(theme.text)
-                        .text_sm()
-                        .child(SharedString::from(filename)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(theme.text_tertiary)
-                        .text_xs()
-                        .child(SharedString::from(metadata)),
-                ),
-        );
-    }
-
-    section
 }
 
 fn format_bytes(bytes: usize) -> String {

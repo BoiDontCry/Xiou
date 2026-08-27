@@ -1758,9 +1758,11 @@ dependencies = [
  "imap-proto",
  "lettre",
  "mail-parser",
+ "raw-window-handle",
  "rusqlite",
  "serde",
  "serde_json",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
  "zeroize",
 ]
