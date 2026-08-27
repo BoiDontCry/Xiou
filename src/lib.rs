@@ -1,3 +1,4 @@
+pub mod account_config;
 pub mod backup;
 pub mod credentials;
 pub mod eml_validate;
