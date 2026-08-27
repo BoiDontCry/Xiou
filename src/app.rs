@@ -558,9 +558,9 @@ impl MailApp {
                     Some(error.as_ref()),
                     "拉取后打开索引",
                 ));
-                self.sync = Some(SyncState::Failed(
-                    SharedString::from("入库后打开索引失败，请查看说明"),
-                ));
+                self.sync = Some(SyncState::Failed(SharedString::from(
+                    "入库后打开索引失败，请查看说明",
+                )));
             }
         }
         cx.notify();
@@ -603,7 +603,7 @@ impl MailApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(self.render_sync_panel(theme, sync.clone(), cx));
+                .child(self.render_sync_panel(theme, sync.clone(), window, cx));
         }
         let Some(onboarding) = self.onboarding.as_ref() else {
             return div().size_full();
@@ -686,16 +686,19 @@ impl MailApp {
     }
 
     fn render_sync_panel(
-        &self,
+        &mut self,
         theme: Theme,
         sync: SyncState,
-        _cx: &mut Context<Self>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (title, detail) = match sync {
-            SyncState::Connecting => ("正在连接 IMAP 服务器…".to_owned(), None),
-            SyncState::Scanning { mailboxes, done } => {
-                (format!("发现邮箱文件夹…（{done}/{mailboxes}）"), None)
-            }
+        let (title, detail, is_failed) = match sync {
+            SyncState::Connecting => ("正在连接 IMAP 服务器…".to_owned(), None, false),
+            SyncState::Scanning { mailboxes, done } => (
+                format!("发现邮箱文件夹…（{done}/{mailboxes}）"),
+                None,
+                false,
+            ),
             SyncState::Mailbox {
                 name,
                 index,
@@ -705,6 +708,7 @@ impl MailApp {
             } => (
                 format!("正在拉取 {name}（{index}/{total}）"),
                 Some(format!("已下载 {backed_up} 封，跳过 {skipped} 封")),
+                false,
             ),
             SyncState::Message {
                 mailbox,
@@ -727,15 +731,17 @@ impl MailApp {
                         format_bytes(done),
                         format_bytes(total)
                     )),
+                    false,
                 )
             }
             SyncState::Done { backed_up, skipped } => (
                 "拉取完成，正在建立索引…".to_owned(),
                 Some(format!("新增 {backed_up} 封，跳过 {skipped} 封")),
+                false,
             ),
-            SyncState::Failed(message) => ("拉取失败".to_owned(), Some(message.to_string())),
+            SyncState::Failed(message) => ("拉取失败".to_owned(), Some(message.to_string()), true),
         };
-        div()
+        let mut panel = div()
             .w(px(420.))
             .flex()
             .flex_col()
@@ -754,7 +760,45 @@ impl MailApp {
                         .text_xs()
                         .child(detail),
                 )
-            })
+            });
+
+        // 失败时给"重新输入账号"按钮：回到 onboarding，保留 host/port/user，清空密码。
+        if is_failed {
+            panel = panel.child(
+                div()
+                    .id("retry-onboarding-button")
+                    .mt_2()
+                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .bg(theme.raised)
+                    .text_color(theme.text)
+                    .text_sm()
+                    .child("重新输入账号")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _, window, cx| {
+                            _this.return_to_onboarding(window, cx);
+                        }),
+                    ),
+            );
+        }
+
+        panel
+    }
+
+    fn return_to_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let defaults = account_config::load()
+            .ok()
+            .flatten()
+            .unwrap_or_else(AccountConfig::defaults);
+        let onboarding = Self::build_onboarding(window, cx, defaults);
+        // build_onboarding 已把 password 初始化为空；host/port/user 从保存的配置预填。
+        self.onboarding = Some(onboarding);
+        self.sync = None;
+        cx.notify();
     }
 
     fn start_attachment_save(
