@@ -1,26 +1,68 @@
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use foxmail_imap::credentials;
-use foxmail_imap::imap_config::{HOST, PORT, USER};
-use foxmail_imap::imap_errors::login_error;
+use crate::credentials;
+use crate::imap_config::{HOST, PORT, USER};
+use crate::imap_errors::login_error;
 use imap::{ClientBuilder, Session};
 use imap_proto::NameAttribute;
 use serde::Serialize;
 
-const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
-struct Options {
-    output: PathBuf,
-    mailbox: Option<String>,
-    max_messages: Option<usize>,
-    chunk_size: usize,
-    dry_run: bool,
-    reset_password: bool,
+pub struct BackupOptions {
+    pub output: PathBuf,
+    pub mailbox: Option<String>,
+    pub max_messages: Option<usize>,
+    pub chunk_size: usize,
+    pub dry_run: bool,
+}
+
+impl Default for BackupOptions {
+    fn default() -> Self {
+        Self {
+            output: PathBuf::from("data"),
+            mailbox: None,
+            max_messages: None,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            dry_run: false,
+        }
+    }
+}
+
+/// 拉取进度回调。所有方法返回 `()`；实现者自行把事件桥接到 UI/日志。
+/// 实现者不应在回调里做长耗时操作或持有锁——它在 IMAP 网络线程的调用栈里同步执行。
+pub trait Progress {
+    fn connecting(&mut self, host: &str, port: u16);
+    fn logged_in(&mut self, user: &str);
+    fn mailboxes_planned(&mut self, count: usize);
+    /// 进入某文件夹。`exists` = 服务器返回的邮件总数，`uids` = 本次计划处理的 UID 数。
+    fn mailbox_start(&mut self, name: &str, exists: u32, uids: usize);
+    /// UID 被跳过（已存在且大小匹配）。
+    fn message_skipped(&mut self, uid: u32, bytes: u64);
+    /// UID 开始下载，`total` = RFC822.SIZE，`resume` = 断点续传起始偏移。
+    fn message_start(&mut self, uid: u32, total: u64, resume: u64);
+    /// UID 下载块到达 `done_bytes`（≤ total）。
+    fn message_progress(&mut self, uid: u32, done: u64, total: u64);
+    fn mailbox_done(&mut self, name: &str, backed_up: usize, skipped: usize);
+    fn finished(&mut self, backed_up: usize, skipped: usize, output: &Path);
+}
+
+/// 无操作进度实现，给 CLI / 无需进度的调用方用。
+pub struct NoProgress;
+impl Progress for NoProgress {
+    fn connecting(&mut self, _host: &str, _port: u16) {}
+    fn logged_in(&mut self, _user: &str) {}
+    fn mailboxes_planned(&mut self, _count: usize) {}
+    fn mailbox_start(&mut self, _name: &str, _exists: u32, _uids: usize) {}
+    fn message_skipped(&mut self, _uid: u32, _bytes: u64) {}
+    fn message_start(&mut self, _uid: u32, _total: u64, _resume: u64) {}
+    fn message_progress(&mut self, _uid: u32, _done: u64, _total: u64) {}
+    fn mailbox_done(&mut self, _name: &str, _backed_up: usize, _skipped: usize) {}
+    fn finished(&mut self, _backed_up: usize, _skipped: usize, _output: &Path) {}
 }
 
 #[derive(Serialize)]
@@ -34,21 +76,36 @@ struct MailboxMetadata<'a> {
     discovered_uid_count: usize,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_options()?;
-    let password = credentials::load_or_initialize(options.reset_password)?;
+/// 用默认账号（imap_config 常量）+ 环境变量/DPAPI 密码跑全量备份。
+/// 供 CLI 与 GUI 复用。`progress` 在 IMAP 网络线程的调用栈里同步回调。
+pub fn run_backup(
+    options: &BackupOptions,
+    progress: &mut dyn Progress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let password = credentials::load_or_initialize(false)?;
+    run_backup_with(options, HOST, PORT, USER, password.as_str(), progress)
+}
 
-    println!("[连接] {}:{}，严格 TLS 校验", HOST, PORT);
-    let client = ClientBuilder::new(HOST, PORT).connect()?;
+/// 显式传入账号凭据跑备份。GUI 用这个传入用户填写的 host/port/user/password。
+pub fn run_backup_with(
+    options: &BackupOptions,
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    progress: &mut dyn Progress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    progress.connecting(host, port);
+    let client = ClientBuilder::new(host, port).connect()?;
     let mut session = client
-        .login(USER, password.as_str())
+        .login(user, password)
         .map_err(|(error, _client)| login_error(error))?;
-    println!("[登录] {}", USER);
+    progress.logged_in(user);
 
     let mailboxes = resolve_mailboxes(&mut session, options.mailbox.as_deref())?;
-    println!("[邮箱] 待处理 {} 个文件夹", mailboxes.len());
+    progress.mailboxes_planned(mailboxes.len());
 
-    let account_root = options.output.join(safe_component(USER));
+    let account_root = options.output.join(safe_component(user));
     let mut total_backed_up = 0usize;
     let mut total_skipped = 0usize;
 
@@ -66,13 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        println!(
-            "\n[文件夹] {} exists={} uid_validity={} 本次 UID={}",
-            mailbox_name,
-            mailbox.exists,
-            uid_validity,
-            uids.len()
-        );
+        progress.mailbox_start(&mailbox_name, mailbox.exists, uids.len());
 
         let mailbox_root = account_root
             .join(safe_component(&mailbox_name))
@@ -83,8 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_metadata(
                 &mailbox_root,
                 &MailboxMetadata {
-                    account: USER,
-                    server: HOST,
+                    account: user,
+                    server: host,
                     mailbox: &mailbox_name,
                     uid_validity,
                     scanned_at_unix: unix_now(),
@@ -94,36 +145,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
 
+        let mut mailbox_backed_up = 0usize;
+        let mut mailbox_skipped = 0usize;
+
         for uid in uids {
             let size = fetch_size(&mut session, uid)?;
             let final_path = mailbox_root.join(format!("{uid:010}.eml"));
 
             if final_path.exists() && final_path.metadata()?.len() == u64::from(size) {
-                println!(
-                    "  [跳过] UID {uid} 已存在，{}",
-                    format_bytes(u64::from(size))
-                );
+                progress.message_skipped(uid, u64::from(size));
+                mailbox_skipped += 1;
                 total_skipped += 1;
                 continue;
             }
 
             if options.dry_run {
-                println!("  [计划] UID {uid}，{}", format_bytes(u64::from(size)));
+                // dry-run 不下载，按"已计划"计入跳过以保持计数一致
+                mailbox_skipped += 1;
+                total_skipped += 1;
                 continue;
             }
 
-            backup_message(&mut session, uid, size, &final_path, options.chunk_size)?;
+            backup_message(
+                &mut session,
+                uid,
+                size,
+                &final_path,
+                options.chunk_size,
+                progress,
+            )?;
+            mailbox_backed_up += 1;
             total_backed_up += 1;
         }
+
+        progress.mailbox_done(&mailbox_name, mailbox_backed_up, mailbox_skipped);
     }
 
     session.logout()?;
-    println!(
-        "\n[完成] 新增 {} 封，跳过 {} 封，输出目录：{}",
-        total_backed_up,
-        total_skipped,
-        account_root.display()
-    );
+    progress.finished(total_backed_up, total_skipped, &account_root);
     Ok(())
 }
 
@@ -177,6 +236,7 @@ fn backup_message<T: Read + Write>(
     expected_size: u32,
     final_path: &Path,
     chunk_size: usize,
+    progress: &mut dyn Progress,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let part_path = final_path.with_extension("eml.part");
     let expected = u64::from(expected_size);
@@ -196,11 +256,7 @@ fn backup_message<T: Read + Write>(
         .append(true)
         .open(&part_path)?;
 
-    println!(
-        "  [备份] UID {uid}，{}，从 {} 继续",
-        format_bytes(expected),
-        format_bytes(offset)
-    );
+    progress.message_start(uid, expected, offset);
 
     while offset < expected {
         let remaining = expected - offset;
@@ -228,15 +284,8 @@ fn backup_message<T: Read + Write>(
 
         file.write_all(body)?;
         offset += body.len() as u64;
-        print!(
-            "\r    进度：{:>6.2}% ({}/{})",
-            percentage(offset, expected),
-            format_bytes(offset),
-            format_bytes(expected)
-        );
-        std::io::stdout().flush()?;
+        progress.message_progress(uid, offset, expected);
     }
-    println!();
 
     file.sync_all()?;
     drop(file);
@@ -270,66 +319,7 @@ fn write_metadata(
     Ok(())
 }
 
-fn parse_options() -> Result<Options, Box<dyn std::error::Error>> {
-    let mut output = env::var_os("FOXMAIL_BACKUP_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data"));
-    let mut mailbox = None;
-    let mut max_messages = None;
-    let mut chunk_size = DEFAULT_CHUNK_SIZE;
-    let mut dry_run = false;
-    let mut reset_password = false;
-
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--output" => output = PathBuf::from(args.next().ok_or("--output 缺少路径")?),
-            "--mailbox" => mailbox = Some(args.next().ok_or("--mailbox 缺少名称")?),
-            "--max-messages" => {
-                let value = args.next().ok_or("--max-messages 缺少数量")?;
-                max_messages = Some(value.parse()?);
-            }
-            "--chunk-mib" => {
-                let value: usize = args.next().ok_or("--chunk-mib 缺少数量")?.parse()?;
-                if value == 0 || value > 64 {
-                    return Err("--chunk-mib 必须在 1..=64".into());
-                }
-                chunk_size = value * 1024 * 1024;
-            }
-            "--dry-run" => dry_run = true,
-            "--reset-password" => reset_password = true,
-            "--help" | "-h" => {
-                print_help();
-                std::process::exit(0);
-            }
-            _ => return Err(format!("未知参数：{arg}，使用 --help 查看帮助").into()),
-        }
-    }
-
-    Ok(Options {
-        output,
-        mailbox,
-        max_messages,
-        chunk_size,
-        dry_run,
-        reset_password,
-    })
-}
-
-fn print_help() {
-    println!(
-        "foxmail backup\n\n\
-         用法：backup [选项]\n\n\
-         --output <目录>        备份根目录，默认 ./data\n\
-         --mailbox <名称>       仅备份指定文件夹\n\
-         --max-messages <数量>  每个文件夹仅处理最新 N 封\n\
-         --chunk-mib <数量>     分块大小 MiB，默认 4，范围 1..=64\n\
-         --dry-run              只列 UID 和大小，不下载正文\n\
-         --reset-password       重新输入并用 DPAPI 保存密码\n"
-    );
-}
-
-fn safe_component(value: &str) -> String {
+pub fn safe_component(value: &str) -> String {
     let mut result = String::with_capacity(value.len() + 17);
     for ch in value.chars() {
         if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' ') {
@@ -365,30 +355,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-fn percentage(done: u64, total: u64) -> f64 {
-    if total == 0 {
-        100.0
-    } else {
-        done as f64 * 100.0 / total as f64
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let value = bytes as f64;
-    if value >= GIB {
-        format!("{:.2} GiB", value / GIB)
-    } else if value >= MIB {
-        format!("{:.2} MiB", value / MIB)
-    } else if value >= KIB {
-        format!("{:.2} KiB", value / KIB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,7 +368,16 @@ mod tests {
     }
 
     #[test]
-    fn percentage_handles_zero() {
-        assert_eq!(percentage(0, 0), 100.0);
+    fn no_progress_is_a_no_op_sink() {
+        let mut sink = NoProgress;
+        sink.connecting("h", 1);
+        sink.logged_in("u");
+        sink.mailboxes_planned(0);
+        sink.mailbox_start("n", 0, 0);
+        sink.message_skipped(1, 0);
+        sink.message_start(1, 0, 0);
+        sink.message_progress(1, 0, 0);
+        sink.mailbox_done("n", 0, 0);
+        sink.finished(0, 0, Path::new("x"));
     }
 }

@@ -13,7 +13,7 @@ path = "src/imap_poc.rs"
 
 [[bin]]
 name = "backup"
-path = "src/backup.rs"
+path = "src/backup_main.rs"
 
 [[bin]]
 name = "validate-eml"
