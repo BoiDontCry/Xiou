@@ -49,6 +49,7 @@ pub struct ComposerInputOptions {
     single_line: bool,
     submit_on_enter: bool,
     list_navigation: bool,
+    masked: bool,
 }
 
 impl ComposerInputOptions {
@@ -58,6 +59,7 @@ impl ComposerInputOptions {
             single_line: true,
             submit_on_enter: false,
             list_navigation: false,
+            masked: false,
         }
     }
 
@@ -67,6 +69,7 @@ impl ComposerInputOptions {
             single_line: false,
             submit_on_enter: false,
             list_navigation: false,
+            masked: false,
         }
     }
 
@@ -77,6 +80,12 @@ impl ComposerInputOptions {
 
     pub fn list_navigation(mut self) -> Self {
         self.list_navigation = true;
+        self
+    }
+
+    /// 密码字段：渲染为掩码，复制/剪切不外泄明文，仍可正常输入与编辑。
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
         self
     }
 }
@@ -96,6 +105,7 @@ pub struct ComposerInput {
     single_line: bool,
     submit_on_enter: bool,
     list_navigation: bool,
+    masked: bool,
 }
 
 impl ComposerInput {
@@ -146,6 +156,7 @@ impl ComposerInput {
             single_line: options.single_line,
             submit_on_enter: options.submit_on_enter,
             list_navigation: options.list_navigation,
+            masked: options.masked,
         }
     }
 
@@ -436,6 +447,11 @@ impl ComposerInput {
         if self.selected_range.is_empty() {
             return;
         }
+        // ponytail: 掩码字段不把明文写剪贴板；仍允许读取（清空）让 Ctrl+C 不报错。
+        if self.masked {
+            cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+            return;
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(
             self.content[self.selected_range.clone()].to_string(),
         ));
@@ -445,9 +461,11 @@ impl ComposerInput {
         if self.selected_range.is_empty() {
             return;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(
-            self.content[self.selected_range.clone()].to_string(),
-        ));
+        if !self.masked {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.content[self.selected_range.clone()].to_string(),
+            ));
+        }
         self.splice(self.selected_range.clone(), "", cx);
     }
 
@@ -666,6 +684,10 @@ fn build_styled_text(input: &ComposerInput, window: &Window) -> StyledText {
     let content_empty = input.content.is_empty();
     let text: SharedString = if content_empty {
         input.placeholder.clone()
+    } else if input.masked {
+        // ponytail: 按字符数生成 ● 掩码，保留光标/选区长度语义。
+        // 不暴露明文给布局层；IME 组合态下 marked_range 仍按真实长度计数。
+        SharedString::from("●".repeat(input.content.chars().count()))
     } else {
         input.content.clone().into()
     };

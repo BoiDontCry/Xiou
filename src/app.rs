@@ -1,3 +1,5 @@
+use foxmail_imap::account_config::{self, AccountConfig};
+use foxmail_imap::backup::{self, BackupOptions};
 use foxmail_imap::mail_store::{
     sanitized_attachment_filename, AttachmentMeta, MailStore, MailboxAccount, MessageDetail,
     MessageSummary, SearchHit,
@@ -10,6 +12,7 @@ use gpui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::composer_editor::{ComposerEvent, ComposerInput, ComposerInputOptions};
@@ -46,6 +49,46 @@ pub struct MailApp {
     _search_subscription: gpui::Subscription,
     save_state: Option<SaveState>,
     paths: AppPaths,
+    onboarding: Option<Onboarding>,
+    sync: Option<SyncState>,
+}
+
+struct Onboarding {
+    host: Entity<ComposerInput>,
+    port: Entity<ComposerInput>,
+    user: Entity<ComposerInput>,
+    password: Entity<ComposerInput>,
+    _subscriptions: Vec<gpui::Subscription>,
+    error: Option<SharedString>,
+}
+
+#[derive(Clone, Debug)]
+enum SyncState {
+    Connecting,
+    Scanning {
+        mailboxes: usize,
+        done: usize,
+    },
+    Mailbox {
+        name: String,
+        index: usize,
+        total: usize,
+        backed_up: usize,
+        skipped: usize,
+    },
+    Message {
+        mailbox: String,
+        mailbox_index: usize,
+        mailbox_total: usize,
+        uid: u32,
+        done: u64,
+        total: u64,
+    },
+    Done {
+        backed_up: usize,
+        skipped: usize,
+    },
+    Failed(SharedString),
 }
 
 enum SaveState {
@@ -74,19 +117,10 @@ impl MailApp {
         );
         let paths = AppPaths::resolve();
         let _ = crate::diagnostics::log_startup(&paths.log, paths.index_source.as_str());
-        let (store, accounts, load_error) = if index_is_missing(&paths.index) {
-            let problem = IndexProblem::Missing;
-            (
-                None,
-                Vec::new(),
-                Some(index_problem_message(
-                    &paths,
-                    "index_missing",
-                    problem,
-                    None,
-                    "打开邮件索引",
-                )),
-            )
+
+        let index_missing = index_is_missing(&paths.index);
+        let (store, accounts, load_error) = if index_missing {
+            (None, Vec::new(), None)
         } else {
             match MailStore::open_read_only(&paths.index).and_then(|store| {
                 let accounts = store.mailbox_tree()?;
@@ -106,6 +140,18 @@ impl MailApp {
                 }
             }
         };
+
+        // 索引缺失 → 进入 onboarding；账号配置不存在时预填默认值（imap.yunyou.top / 993 / 当前 user）。
+        let onboarding = if index_missing {
+            let defaults = account_config::load()
+                .ok()
+                .flatten()
+                .unwrap_or_else(AccountConfig::defaults);
+            Some(Self::build_onboarding(window, cx, defaults))
+        } else {
+            None
+        };
+
         let selected_mailbox = accounts
             .iter()
             .flat_map(|account| account.mailboxes.iter())
@@ -136,7 +182,579 @@ impl MailApp {
             _search_subscription: search_subscription,
             save_state: None,
             paths,
+            onboarding,
+            sync: None,
         }
+    }
+
+    fn build_onboarding(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        defaults: AccountConfig,
+    ) -> Onboarding {
+        let host = cx.new(|cx| {
+            ComposerInput::new(
+                window,
+                cx,
+                defaults.host,
+                ComposerInputOptions::single_line("IMAP 服务器"),
+            )
+        });
+        let port = cx.new(|cx| {
+            ComposerInput::new(
+                window,
+                cx,
+                defaults.port.to_string(),
+                ComposerInputOptions::single_line("端口"),
+            )
+        });
+        let user = cx.new(|cx| {
+            ComposerInput::new(
+                window,
+                cx,
+                defaults.user,
+                ComposerInputOptions::single_line("邮箱地址"),
+            )
+        });
+        let password = cx.new(|cx| {
+            ComposerInput::new(
+                window,
+                cx,
+                String::new(),
+                ComposerInputOptions::single_line("密码 / 授权码").masked(),
+            )
+        });
+        let fields = [&host, &port, &user, &password];
+        let subscriptions = fields
+            .iter()
+            .map(|field| {
+                cx.subscribe(
+                    field,
+                    |this: &mut MailApp, _input, _event: &ComposerEvent, cx| {
+                        if this.onboarding.as_ref().is_some_and(|o| o.error.is_some()) {
+                            this.update_onboarding_error(None, cx);
+                        }
+                    },
+                )
+            })
+            .collect();
+        Onboarding {
+            host,
+            port,
+            user,
+            password,
+            _subscriptions: subscriptions,
+            error: None,
+        }
+    }
+
+    fn update_onboarding_error(&mut self, error: Option<SharedString>, cx: &mut Context<Self>) {
+        if let Some(onboarding) = self.onboarding.as_mut() {
+            onboarding.error = error;
+        }
+        cx.notify();
+    }
+
+    /// 读取 onboarding 表单，校验并落盘账号配置，返回 ready 的 AccountConfig。
+    fn collect_onboarding_account(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Result<AccountConfig, SharedString> {
+        let onboarding = self
+            .onboarding
+            .as_ref()
+            .ok_or_else(|| SharedString::from("账号配置界面不可用"))?;
+        let host = onboarding.host.read(cx).content().trim().to_owned();
+        let user = onboarding.user.read(cx).content().trim().to_owned();
+        let port_text = onboarding.port.read(cx).content().trim().to_owned();
+        let password = onboarding.password.read(cx).content().to_owned();
+
+        if host.is_empty() {
+            return Err(SharedString::from("请填写 IMAP 服务器地址"));
+        }
+        if user.is_empty() {
+            return Err(SharedString::from("请填写邮箱地址"));
+        }
+        if password.is_empty() {
+            return Err(SharedString::from("请填写密码或授权码"));
+        }
+        let port: u16 = port_text
+            .parse()
+            .map_err(|_| SharedString::from("端口必须是数字，IMAP 通常为 993"))?;
+        Ok(AccountConfig {
+            host,
+            port,
+            user,
+            password,
+        })
+    }
+
+    fn start_sync(&mut self, cx: &mut Context<Self>) {
+        let account = match self.collect_onboarding_account(cx) {
+            Ok(account) => account,
+            Err(error) => {
+                self.update_onboarding_error(Some(error), cx);
+                return;
+            }
+        };
+        let output = self.backup_root_for(&account);
+        if let Err(error) = account_config::save(&account) {
+            self.update_onboarding_error(
+                Some(SharedString::from(format!("保存账号配置失败：{error}"))),
+                cx,
+            );
+            return;
+        }
+
+        let host = account.host.clone();
+        let port = account.port;
+        let user = account.user.clone();
+        let password = account.password.clone();
+        self.sync = Some(SyncState::Connecting);
+        self.onboarding = None;
+        cx.notify();
+
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<backup::ProgressEvent>();
+
+        // 后台线程跑 IMAP 拉取；错误在线程内转 String 并发一个 Failed 事件后退出。
+        // Box<dyn Error> 不跨线程，规避 Send 缺失；sender drop 让 pump 收尾。
+        let options = BackupOptions {
+            output,
+            mailbox: None,
+            max_messages: None,
+            chunk_size: backup::DEFAULT_CHUNK_SIZE,
+            dry_run: false,
+        };
+        let progress_tx_clone = progress_tx.clone();
+        std::thread::spawn(move || {
+            let mut progress = backup::ChannelProgress::new(progress_tx_clone);
+            if let Err(error) =
+                backup::run_backup_with(&options, &host, port, &user, &password, &mut progress)
+            {
+                progress.send_failed(error.to_string());
+            }
+        });
+        drop(progress_tx);
+
+        cx.spawn(async move |this, cx| {
+            // ponytail: 单 receiver 留在本闭包，100ms try_recv 攒批 flush 给 UI；
+            // 全部 sender drop 后 try_recv 拿空且 is_empty 判定收尾。
+            let mut batch: Vec<backup::ProgressEvent> = Vec::new();
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                // ponytail: Receiver 无 is_empty/len；用 try_recv 清空判定。
+                // sender 全部 drop 后 try_recv 返回 Err → 本轮无新增且上次也无 → 收尾。
+                let mut got_any = false;
+                while let Ok(event) = progress_rx.try_recv() {
+                    batch.push(event);
+                    got_any = true;
+                }
+                if !batch.is_empty() {
+                    this.update(cx, |this, cx| {
+                        for event in batch.drain(..) {
+                            this.apply_progress(event);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                if !got_any {
+                    // 本轮无事件；若 channel 已关（sender drop），下一轮仍无 → 加一次确认后退出。
+                    // 用 same_consumer 不可行；直接判 try_recv 连续两轮空即退出。
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    while let Ok(event) = progress_rx.try_recv() {
+                        batch.push(event);
+                        got_any = true;
+                    }
+                    if got_any {
+                        this.update(cx, |this, cx| {
+                            for event in batch.drain(..) {
+                                this.apply_progress(event);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            this.update(cx, |this, cx| this.finish_sync(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn apply_progress(&mut self, event: backup::ProgressEvent) {
+        use backup::ProgressEvent::*;
+        let next = match event {
+            Connecting { .. } => SyncState::Connecting,
+            LoggedIn { .. } => self.sync.clone().unwrap_or(SyncState::Connecting),
+            MailboxesPlanned { count } => SyncState::Scanning {
+                mailboxes: count,
+                done: 0,
+            },
+            MailboxStart {
+                name,
+                uids: _,
+                exists: _,
+            } => {
+                let (index, total) = match &self.sync {
+                    Some(SyncState::Scanning { done, mailboxes }) => (*done + 1, *mailboxes),
+                    Some(SyncState::Mailbox { index, total, .. }) => (*index + 1, *total),
+                    _ => (1, 0),
+                };
+                SyncState::Mailbox {
+                    name,
+                    index,
+                    total,
+                    backed_up: 0,
+                    skipped: 0,
+                }
+            }
+            MessageSkipped { .. } => {
+                if let Some(SyncState::Mailbox { skipped, .. }) = self.sync.as_mut() {
+                    *skipped += 1;
+                }
+                return;
+            }
+            MessageStart { uid, total, .. } => {
+                let (mailbox, mailbox_index, mailbox_total) = match &self.sync {
+                    Some(SyncState::Mailbox {
+                        name, index, total, ..
+                    }) => (name.clone(), *index, *total),
+                    _ => (String::new(), 0, 0),
+                };
+                if let Some(SyncState::Mailbox { backed_up, .. }) = self.sync.as_mut() {
+                    *backed_up += 1;
+                }
+                SyncState::Message {
+                    mailbox,
+                    mailbox_index,
+                    mailbox_total,
+                    uid,
+                    done: 0,
+                    total,
+                }
+            }
+            MessageProgress { done, total, .. } => {
+                if let Some(SyncState::Message {
+                    done: d, total: t, ..
+                }) = self.sync.as_mut()
+                {
+                    *d = done;
+                    *t = total;
+                }
+                return;
+            }
+            MailboxDone {
+                backed_up, skipped, ..
+            } => {
+                // 回到 Mailbox 视图并落定本文件夹最终计数。
+                let (name, index, total) = match self.sync.clone() {
+                    Some(SyncState::Mailbox {
+                        name, index, total, ..
+                    }) => (name, index, total),
+                    Some(SyncState::Message {
+                        mailbox,
+                        mailbox_index,
+                        mailbox_total,
+                        ..
+                    }) => (mailbox, mailbox_index, mailbox_total),
+                    other => match other {
+                        Some(SyncState::Connecting) | None => (String::new(), 0, 0),
+                        Some(_) => (String::new(), 0, 0),
+                    },
+                };
+                SyncState::Mailbox {
+                    name,
+                    index,
+                    total,
+                    backed_up,
+                    skipped,
+                }
+            }
+            Finished { backed_up, skipped } => SyncState::Done { backed_up, skipped },
+            Failed { message } => SyncState::Failed(SharedString::from(message)),
+        };
+        self.sync = Some(next);
+    }
+
+    fn finish_sync(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.sync.as_ref(), Some(SyncState::Failed(_))) {
+            cx.notify();
+            return;
+        }
+        let backup_root = match self.last_backup_root() {
+            Some(root) => root,
+            None => {
+                self.sync = Some(SyncState::Failed(SharedString::from(
+                    "拉取完成但未找到备份目录",
+                )));
+                cx.notify();
+                return;
+            }
+        };
+        let index_path = self.paths.index.clone();
+        self.sync = Some(SyncState::Done {
+            backed_up: 0,
+            skipped: 0,
+        });
+        cx.notify();
+
+        cx.background_executor()
+            .spawn(async move {
+                let result = std::thread::spawn(move || -> Result<(), String> {
+                    let mut store = MailStore::open(&index_path).map_err(|e| e.to_string())?;
+                    store
+                        .import_backup(&backup_root)
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                })
+                .join();
+                match result {
+                    Ok(Ok(())) => Ok::<(), String>(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err("入库线程异常退出".to_string()),
+                }
+            })
+            .detach();
+
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| this.reload_index(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn reload_index(&mut self, cx: &mut Context<Self>) {
+        match MailStore::open_read_only(&self.paths.index).and_then(|store| {
+            let accounts = store.mailbox_tree()?;
+            Ok((store, accounts))
+        }) {
+            Ok((store, accounts)) => {
+                self.store = Some(store);
+                self.accounts = accounts;
+                self.selected_mailbox = self
+                    .accounts
+                    .iter()
+                    .flat_map(|a| a.mailboxes.iter())
+                    .next()
+                    .map(|m| m.id);
+                self.load_error = None;
+                self.sync = None;
+                self.message_pages.clear();
+                self.selected_message = None;
+                self.selected_detail = None;
+            }
+            Err(error) => {
+                let problem = classify_index_error(error.as_ref());
+                self.load_error = Some(index_problem_message(
+                    &self.paths,
+                    "index_open_after_sync",
+                    problem,
+                    Some(error.as_ref()),
+                    "拉取后打开索引",
+                ));
+                self.sync = Some(SyncState::Failed(
+                    SharedString::from("入库后打开索引失败，请查看说明"),
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    fn backup_root_for(&self, _account: &AccountConfig) -> PathBuf {
+        // 便携优先：EXE 同目录 data；否则用户目录 data。
+        // 索引路径的父目录即 data 根（见 paths::resolve_paths）；账号无关。
+        self.paths
+            .index
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("data"))
+    }
+
+    fn last_backup_root(&self) -> Option<PathBuf> {
+        // backup 落盘到 backup_root_for/<safe_component(user)>；复用 backup 的命名。
+        self.sync
+            .as_ref()
+            .and_then(|s| match s {
+                SyncState::Done { .. } => Some(()),
+                _ => None,
+            })
+            .and_then(|_| {
+                let account = account_config::load().ok().flatten()?;
+                let root = self.backup_root_for(&account);
+                Some(root.join(backup::safe_component(&account.user)))
+            })
+    }
+
+    fn render_onboarding_or_sync(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        if let Some(sync) = &self.sync {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.render_sync_panel(theme, sync.clone(), cx));
+        }
+        let Some(onboarding) = self.onboarding.as_ref() else {
+            return div().size_full();
+        };
+        let host_field = onboarding.host.clone();
+        let port_field = onboarding.port.clone();
+        let user_field = onboarding.user.clone();
+        let password_field = onboarding.password.clone();
+        let error = onboarding.error.clone();
+        let host_label = onboarding.host.read(cx).content().to_owned();
+        let _ = (window, host_label);
+
+        let mut card = div()
+            .w(px(420.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .px_8()
+            .py_8()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.))
+            .child(div().text_color(theme.text).text_lg().child("设置邮箱账号"))
+            .child(
+                div()
+                    .text_color(theme.text_secondary)
+                    .text_xs()
+                    .child("填写 IMAP 服务器与凭据，首次拉取会把邮件备份到本地并建立索引。"),
+            )
+            .child(onboarding_field(theme, "IMAP 服务器", &host_field, cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(onboarding_field(theme, "端口", &port_field, cx)),
+                    ),
+            )
+            .child(onboarding_field(theme, "邮箱地址", &user_field, cx))
+            .child(onboarding_field(
+                theme,
+                "密码 / 授权码",
+                &password_field,
+                cx,
+            ));
+
+        if let Some(error) = error {
+            card = card.child(div().text_color(theme.accent).text_xs().child(error));
+        }
+
+        card = card.child(
+            div()
+                .id("start-sync-button")
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(theme.accent)
+                .text_color(gpui::hsla(0., 0., 0., 1.))
+                .text_sm()
+                .child("拉取邮件")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_this, _, _, cx| {
+                        _this.start_sync(cx);
+                    }),
+                ),
+        );
+
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(card)
+    }
+
+    fn render_sync_panel(
+        &self,
+        theme: Theme,
+        sync: SyncState,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (title, detail) = match sync {
+            SyncState::Connecting => ("正在连接 IMAP 服务器…".to_owned(), None),
+            SyncState::Scanning { mailboxes, done } => {
+                (format!("发现邮箱文件夹…（{done}/{mailboxes}）"), None)
+            }
+            SyncState::Mailbox {
+                name,
+                index,
+                total,
+                backed_up,
+                skipped,
+            } => (
+                format!("正在拉取 {name}（{index}/{total}）"),
+                Some(format!("已下载 {backed_up} 封，跳过 {skipped} 封")),
+            ),
+            SyncState::Message {
+                mailbox,
+                mailbox_index,
+                mailbox_total,
+                uid,
+                done,
+                total,
+            } => {
+                let pct = if total == 0 {
+                    100.0
+                } else {
+                    done as f64 * 100.0 / total as f64
+                };
+                (
+                    format!("{mailbox}（{mailbox_index}/{mailbox_total}）UID {uid}"),
+                    Some(format!(
+                        "{:.1}%（{} / {}）",
+                        pct,
+                        format_bytes(done),
+                        format_bytes(total)
+                    )),
+                )
+            }
+            SyncState::Done { backed_up, skipped } => (
+                "拉取完成，正在建立索引…".to_owned(),
+                Some(format!("新增 {backed_up} 封，跳过 {skipped} 封")),
+            ),
+            SyncState::Failed(message) => ("拉取失败".to_owned(), Some(message.to_string())),
+        };
+        div()
+            .w(px(420.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_8()
+            .py_8()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.))
+            .child(div().text_color(theme.text).text_lg().child(title))
+            .when_some(detail, |panel, detail| {
+                panel.child(
+                    div()
+                        .text_color(theme.text_secondary)
+                        .text_xs()
+                        .child(detail),
+                )
+            })
     }
 
     fn start_attachment_save(
@@ -1168,6 +1786,14 @@ impl MailApp {
 
 impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.onboarding.is_some() || self.sync.is_some() {
+            return div()
+                .size_full()
+                .overflow_hidden()
+                .bg(self.theme.canvas)
+                .text_color(self.theme.text)
+                .child(self.render_onboarding_or_sync(window, cx));
+        }
         div()
             .size_full()
             .overflow_hidden()
@@ -1178,6 +1804,33 @@ impl Render for MailApp {
             .child(self.render_message_list(cx, window))
             .child(self.render_reader(cx, window))
     }
+}
+
+fn field_label(theme: Theme, text: &'static str) -> impl IntoElement {
+    div().text_color(theme.text_tertiary).text_xs().child(text)
+}
+
+fn onboarding_field(
+    theme: Theme,
+    label: &'static str,
+    field: &Entity<ComposerInput>,
+    _cx: &mut Context<MailApp>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(field_label(theme, label))
+        .child(
+            div()
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(4.))
+                .px_2()
+                .py_1()
+                .child(field.clone()),
+        )
 }
 
 fn mailbox_label(source_name: &str, display_name: &str) -> String {
@@ -1600,7 +2253,7 @@ impl MailApp {
                 "{} · {} · {}",
                 marker,
                 attachment.content_type,
-                format_bytes(attachment.size_bytes)
+                format_attachment_bytes(attachment.size_bytes)
             );
             let message_id = self.selected_message.unwrap_or_default();
             let save_target = sanitized_attachment_filename(&attachment.filename);
@@ -1662,17 +2315,21 @@ impl MailApp {
     }
 }
 
-fn format_bytes(bytes: usize) -> String {
+fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
-    let bytes = bytes as f64;
-    if bytes < KIB {
-        format!("{} B", bytes as usize)
-    } else if bytes < MIB {
-        format!("{:.1} KiB", bytes / KIB)
+    let value = bytes as f64;
+    if value < KIB {
+        format!("{} B", bytes)
+    } else if value < MIB {
+        format!("{:.1} KiB", value / KIB)
     } else {
-        format!("{:.1} MiB", bytes / MIB)
+        format!("{:.1} MiB", value / MIB)
     }
+}
+
+fn format_attachment_bytes(bytes: usize) -> String {
+    format_bytes(bytes as u64)
 }
 
 fn normalize_plain_body(value: &str) -> String {

@@ -65,6 +65,140 @@ impl Progress for NoProgress {
     fn finished(&mut self, _backed_up: usize, _skipped: usize, _output: &Path) {}
 }
 
+/// 进度事件，GUI 把它跨线程桥接到主线程更新 UI。
+#[derive(Clone, Debug)]
+pub enum ProgressEvent {
+    Connecting {
+        host: String,
+        port: u16,
+    },
+    LoggedIn {
+        user: String,
+    },
+    MailboxesPlanned {
+        count: usize,
+    },
+    MailboxStart {
+        name: String,
+        exists: u32,
+        uids: usize,
+    },
+    MessageSkipped {
+        uid: u32,
+        bytes: u64,
+    },
+    MessageStart {
+        uid: u32,
+        total: u64,
+        resume: u64,
+    },
+    MessageProgress {
+        uid: u32,
+        done: u64,
+        total: u64,
+    },
+    MailboxDone {
+        name: String,
+        backed_up: usize,
+        skipped: usize,
+    },
+    Finished {
+        backed_up: usize,
+        skipped: usize,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+/// 把 `Progress` 事件转成 `mpsc::Sender<ProgressEvent>` 的桥接实现。
+/// GUI 用它把 IMAP 线程的事件泵到主线程。
+pub struct ChannelProgress {
+    pub sender: std::sync::mpsc::Sender<ProgressEvent>,
+    pub state: ChannelState,
+}
+
+#[derive(Default)]
+pub struct ChannelState {
+    pub index: usize,
+    pub total_mailboxes: usize,
+    pub mailbox_name: String,
+    pub mailbox_backed_up: usize,
+    pub mailbox_skipped: usize,
+}
+
+impl ChannelProgress {
+    pub fn new(sender: std::sync::mpsc::Sender<ProgressEvent>) -> Self {
+        Self {
+            sender,
+            state: ChannelState::default(),
+        }
+    }
+
+    /// 拉取失败时发一个 Failed 事件（由调用方在错误路径上调用）。
+    pub fn send_failed(&mut self, message: String) {
+        let _ = self.sender.send(ProgressEvent::Failed { message });
+    }
+}
+
+impl Progress for ChannelProgress {
+    fn connecting(&mut self, host: &str, port: u16) {
+        let _ = self.sender.send(ProgressEvent::Connecting {
+            host: host.to_owned(),
+            port,
+        });
+    }
+    fn logged_in(&mut self, user: &str) {
+        let _ = self.sender.send(ProgressEvent::LoggedIn {
+            user: user.to_owned(),
+        });
+    }
+    fn mailboxes_planned(&mut self, count: usize) {
+        self.state.total_mailboxes = count;
+        let _ = self.sender.send(ProgressEvent::MailboxesPlanned { count });
+    }
+    fn mailbox_start(&mut self, name: &str, exists: u32, uids: usize) {
+        self.state.index += 1;
+        self.state.mailbox_name = name.to_owned();
+        self.state.mailbox_backed_up = 0;
+        self.state.mailbox_skipped = 0;
+        let _ = self.sender.send(ProgressEvent::MailboxStart {
+            name: name.to_owned(),
+            exists,
+            uids,
+        });
+    }
+    fn message_skipped(&mut self, uid: u32, bytes: u64) {
+        self.state.mailbox_skipped += 1;
+        let _ = self
+            .sender
+            .send(ProgressEvent::MessageSkipped { uid, bytes });
+    }
+    fn message_start(&mut self, uid: u32, total: u64, resume: u64) {
+        self.state.mailbox_backed_up += 1;
+        let _ = self
+            .sender
+            .send(ProgressEvent::MessageStart { uid, total, resume });
+    }
+    fn message_progress(&mut self, uid: u32, done: u64, total: u64) {
+        let _ = self
+            .sender
+            .send(ProgressEvent::MessageProgress { uid, done, total });
+    }
+    fn mailbox_done(&mut self, name: &str, backed_up: usize, skipped: usize) {
+        let _ = self.sender.send(ProgressEvent::MailboxDone {
+            name: name.to_owned(),
+            backed_up,
+            skipped,
+        });
+    }
+    fn finished(&mut self, backed_up: usize, skipped: usize, _output: &Path) {
+        let _ = self
+            .sender
+            .send(ProgressEvent::Finished { backed_up, skipped });
+    }
+}
+
 #[derive(Serialize)]
 struct MailboxMetadata<'a> {
     account: &'a str,

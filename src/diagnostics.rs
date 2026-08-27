@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexProblem {
-    Missing,
     Corrupt,
     CannotOpen,
     QueryFailed,
@@ -16,7 +15,6 @@ pub enum IndexProblem {
 impl IndexProblem {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Missing => "missing",
             Self::Corrupt => "corrupt",
             Self::CannotOpen => "cannot_open",
             Self::QueryFailed => "query_failed",
@@ -53,10 +51,6 @@ pub fn index_message(problem: IndexProblem, operation: &str, index: &Path) -> St
         .unwrap_or(index.as_os_str())
         .to_string_lossy();
     match problem {
-        IndexProblem::Missing => format!(
-            "未找到邮件索引：{}。请设置 FOXMAIL_INDEX_PATH，或将 data 文件夹放到程序同目录。",
-            index
-        ),
         IndexProblem::Corrupt => format!(
             "邮件索引已损坏或格式无效：{}。请重新运行 import-eml 生成索引。",
             index
@@ -148,14 +142,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn explains_missing_index_without_sqlite_details() {
+    fn explains_corrupt_index_without_sqlite_details() {
         let message = index_message(
-            IndexProblem::Missing,
+            IndexProblem::Corrupt,
             "打开",
             Path::new("private/data/mail-index.sqlite"),
         );
-        assert!(message.contains("未找到邮件索引"));
-        assert!(message.contains("FOXMAIL_INDEX_PATH"));
+        assert!(message.contains("索引已损坏"));
+        assert!(message.contains("import-eml"));
         assert!(!message.contains("private"));
     }
 
