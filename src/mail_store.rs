@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS message (
     body TEXT NOT NULL,
     html_body TEXT NOT NULL,
     attachment_count INTEGER NOT NULL,
+    message_id TEXT NOT NULL DEFAULT '',
     UNIQUE(mailbox_id, uid)
 );
 
@@ -76,6 +77,14 @@ END;
 "#;
 
 pub type StoreResult<T> = Result<T, Box<dyn Error>>;
+
+/// 本地归档邮箱的 UIDVALIDITY 哨兵值。RFC 3501 规定真实 UIDVALIDITY 非零，故 0 可安全占用。
+/// 归档邮件已改为并入收件箱，此值现在只用于识别并清理早期版本留下的独立归档邮箱。
+const ARCHIVE_UID_VALIDITY: u32 = 0;
+
+/// 归档邮件的 UID 基址。真实 IMAP UID 目前在 ~1.15e6 量级，3e9 起步不会相撞，
+/// 且 3e9 + 归档数量仍在 u32 范围内。
+const ARCHIVE_UID_BASE: u32 = 3_000_000_000;
 
 #[derive(Debug, Deserialize)]
 struct MailboxMetadata {
@@ -185,6 +194,7 @@ impl MailStore {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(SCHEMA)?;
+        migrate(&connection)?;
         Ok(Self {
             connection,
             source_root: source_root(path),
@@ -212,6 +222,77 @@ impl MailStore {
 
         transaction.commit()?;
         Ok(summary)
+    }
+
+    /// 导入散装 `.eml` 目录（Foxmail 等客户端导出的历史邮件，文件名是主题而非 UID）。
+    /// 邮件直接并入该账号的收件箱，与 IMAP 邮件同列表按日期排序；`eml_path` 存绝对路径，
+    /// 因为归档目录通常不在索引目录下。
+    pub fn import_archive(&mut self, archive_root: &Path) -> StoreResult<ImportSummary> {
+        let root = if archive_root.is_absolute() {
+            archive_root.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(archive_root)
+        };
+        let (account, server) = self.sole_account()?;
+        let files = list_eml_files_recursive(&root)?;
+        let discovered = files.len();
+        let source_root = self.source_root.clone();
+
+        let transaction = self.connection.transaction()?;
+        let mailbox_id = inbox_mailbox_id(&transaction, &account, &server)?;
+        // 早期版本把归档挂成独立「本地归档」文件夹（uid_validity 哨兵 0）。改为并入收件箱后
+        // 必须清掉遗留哨兵邮箱，否则同一批邮件会同时出现在两处。
+        remove_archive_mailboxes(&transaction, &account, &server)?;
+        // 归档行完全由归档目录派生：先清掉上一次导入的归档行，再整批重建。
+        // 这样目录里删掉的邮件不会留残行，也不必猜哪一行还对应哪个文件。
+        // 代价是每次都重解析整个归档目录（645 封 / 5 GB 约 25 秒），手动操作可接受。
+        transaction.execute(
+            "DELETE FROM message WHERE mailbox_id = ?1 AND uid >= ?2",
+            params![mailbox_id, ARCHIVE_UID_BASE],
+        )?;
+        // 去重要靠 Message-ID 比对，已同步的 IMAP 邮件行可能是迁移前入库的空值，先补齐。
+        backfill_message_ids(&transaction, mailbox_id, source_root.as_deref())?;
+        let mut summary = ImportSummary {
+            mailboxes: 1,
+            discovered_messages: discovered,
+            ..ImportSummary::default()
+        };
+        // ponytail: UID = 基址 + 排序后序号，散装文件没有服务器 UID；基址远离真实 UID 段以免撞键。
+        for (index, eml_path) in files.iter().enumerate() {
+            let offset = u32::try_from(index + 1)?;
+            let uid = ARCHIVE_UID_BASE
+                .checked_add(offset)
+                .ok_or("归档邮件数超出 UID 空间")?;
+            let source = absolute_fingerprint(eml_path)?;
+            import_eml_file(
+                &transaction,
+                mailbox_id,
+                uid,
+                eml_path,
+                source,
+                true,
+                &mut summary,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    /// 归档要挂到哪个账号：取索引里已有的唯一 IMAP 账号（排除归档自身）。
+    fn sole_account(&self) -> StoreResult<(String, String)> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT account, server FROM mailbox WHERE uid_validity <> 0")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        match rows.len() {
+            1 => Ok(rows.into_iter().next().expect("已确认恰好一行")),
+            0 => Err("索引里还没有 IMAP 账号，请先完成一次同步再导入归档".into()),
+            count => Err(format!("索引里有 {count} 个账号，归档归属不明确").into()),
+        }
     }
 
     pub fn search(&self, query: &str, limit: usize) -> StoreResult<Vec<SearchHit>> {
@@ -547,14 +628,7 @@ impl MailStore {
     }
 
     fn resolve_source_path(&self, stored_path: &str) -> PathBuf {
-        let path = Path::new(stored_path);
-        if path.is_absolute() {
-            path.to_owned()
-        } else {
-            self.source_root
-                .as_deref()
-                .map_or_else(|| path.to_owned(), |root| root.join(path))
-        }
+        resolve_stored_path(self.source_root.as_deref(), stored_path)
     }
 
     pub fn integrity_check(&self) -> StoreResult<IntegrityReport> {
@@ -666,62 +740,106 @@ fn import_mailbox(
     for eml_path in eml_files {
         let uid = parse_uid(&eml_path)?;
         let source = source_fingerprint(data_root, &eml_path)?;
-        let existing = transaction
-            .query_row(
-                "SELECT eml_path, size_bytes, modified_unix
+        import_eml_file(
+            transaction,
+            mailbox_id,
+            uid,
+            &eml_path,
+            source,
+            false,
+            summary,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// 把单个 `.eml` 落库。`source` 为 (存库路径, 字节数, 修改时间纳秒)：
+/// IMAP 备份传相对路径，本地归档传绝对路径（归档目录不在索引目录下）。
+/// `dedupe_by_message_id` 仅归档导入开启：导出的历史邮件常与已同步的服务器邮件重叠，
+/// 同一 Message-ID 已在该邮箱里就跳过，保留服务器那份（有真实 UID）。
+fn import_eml_file(
+    transaction: &Transaction<'_>,
+    mailbox_id: i64,
+    uid: u32,
+    eml_path: &Path,
+    source: (String, i64, i64),
+    dedupe_by_message_id: bool,
+    summary: &mut ImportSummary,
+) -> StoreResult<()> {
+    let existing = transaction
+        .query_row(
+            "SELECT eml_path, size_bytes, modified_unix
                  FROM message
                  WHERE mailbox_id = ?1 AND uid = ?2",
-                params![mailbox_id, uid],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+            params![mailbox_id, uid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if existing
+        .as_ref()
+        .is_some_and(|existing| existing == &source)
+    {
+        summary.skipped += 1;
+        return Ok(());
+    }
+
+    let raw = fs::read(eml_path)?;
+    let message = MessageParser::default()
+        .parse(&raw)
+        .ok_or_else(|| format!("无法解析 RFC822/MIME 邮件：{}", eml_path.display()))?;
+    let subject = message.subject().unwrap_or_default().trim().to_owned();
+    let sender = format_addresses(message.from());
+    let recipients = join_nonempty([
+        format_addresses(message.to()),
+        format_addresses(message.cc()),
+    ]);
+    let date_text = message.date().map(ToString::to_string);
+    let date_unix = message.date().map(|date| date.to_timestamp());
+    let text_body = collect_bodies(message.text_body_count(), |index| {
+        message.body_text(index).map(|body| body.into_owned())
+    });
+    let html_body = collect_bodies(message.html_body_count(), |index| {
+        message.body_html(index).map(|body| body.into_owned())
+    });
+    let searchable_body = if text_body.trim().is_empty() {
+        html_body.clone()
+    } else {
+        text_body
+    };
+    let attachment_count = i64::try_from(message.attachment_count())?;
+    let message_id = message.message_id().unwrap_or_default().trim().to_owned();
+
+    if dedupe_by_message_id && !message_id.is_empty() {
+        let duplicate = transaction
+            .query_row(
+                "SELECT id FROM message
+                 WHERE mailbox_id = ?1 AND message_id = ?2 AND uid <> ?3
+                 LIMIT 1",
+                params![mailbox_id, message_id, uid],
+                |row| row.get::<_, i64>(0),
             )
             .optional()?;
-
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing == &source)
-        {
+        if duplicate.is_some() {
             summary.skipped += 1;
-            continue;
+            return Ok(());
         }
+    }
 
-        let raw = fs::read(&eml_path)?;
-        let message = MessageParser::default()
-            .parse(&raw)
-            .ok_or_else(|| format!("无法解析 RFC822/MIME 邮件：{}", eml_path.display()))?;
-        let subject = message.subject().unwrap_or_default().trim().to_owned();
-        let sender = format_addresses(message.from());
-        let recipients = join_nonempty([
-            format_addresses(message.to()),
-            format_addresses(message.cc()),
-        ]);
-        let date_text = message.date().map(ToString::to_string);
-        let date_unix = message.date().map(|date| date.to_timestamp());
-        let text_body = collect_bodies(message.text_body_count(), |index| {
-            message.body_text(index).map(|body| body.into_owned())
-        });
-        let html_body = collect_bodies(message.html_body_count(), |index| {
-            message.body_html(index).map(|body| body.into_owned())
-        });
-        let searchable_body = if text_body.trim().is_empty() {
-            html_body.clone()
-        } else {
-            text_body
-        };
-        let attachment_count = i64::try_from(message.attachment_count())?;
-
-        transaction.execute(
-            "INSERT INTO message (
+    transaction.execute(
+        "INSERT INTO message (
                  mailbox_id, uid, eml_path, size_bytes, modified_unix,
                  subject, sender, recipients, date_text, date_unix,
-                 body, html_body, attachment_count
+                 body, html_body, attachment_count, message_id
              ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
              )
              ON CONFLICT(mailbox_id, uid) DO UPDATE SET
                  eml_path = excluded.eml_path,
@@ -734,29 +852,30 @@ fn import_mailbox(
                  date_unix = excluded.date_unix,
                  body = excluded.body,
                  html_body = excluded.html_body,
-                 attachment_count = excluded.attachment_count",
-            params![
-                mailbox_id,
-                uid,
-                source.0,
-                source.1,
-                source.2,
-                subject,
-                sender,
-                recipients,
-                date_text,
-                date_unix,
-                searchable_body,
-                html_body,
-                attachment_count,
-            ],
-        )?;
+                 attachment_count = excluded.attachment_count,
+                 message_id = excluded.message_id",
+        params![
+            mailbox_id,
+            uid,
+            source.0,
+            source.1,
+            source.2,
+            subject,
+            sender,
+            recipients,
+            date_text,
+            date_unix,
+            searchable_body,
+            html_body,
+            attachment_count,
+            message_id,
+        ],
+    )?;
 
-        if existing.is_some() {
-            summary.updated += 1;
-        } else {
-            summary.inserted += 1;
-        }
+    if existing.is_some() {
+        summary.updated += 1;
+    } else {
+        summary.inserted += 1;
     }
 
     Ok(())
@@ -851,6 +970,125 @@ fn list_eml_files(directory: &Path) -> StoreResult<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// 老索引缺 `message_id` 列时补上。只在可写连接调用；`open_read_only()` 不查该列，
+/// 因此未迁移的旧索引仍能被只读打开。
+fn migrate(connection: &Connection) -> StoreResult<()> {
+    let has_message_id: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('message') WHERE name = 'message_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_message_id == 0 {
+        connection.execute(
+            "ALTER TABLE message ADD COLUMN message_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS message_mailbox_message_id_idx
+             ON message(mailbox_id, message_id);",
+    )?;
+    Ok(())
+}
+
+/// 存库路径 → 磁盘路径。IMAP 邮件存相对路径（按索引所在目录解析），归档存绝对路径。
+fn resolve_stored_path(source_root: Option<&Path>, stored_path: &str) -> PathBuf {
+    let path = Path::new(stored_path);
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        source_root.map_or_else(|| path.to_owned(), |root| root.join(path))
+    }
+}
+
+/// 为该邮箱里 `message_id` 为空的旧行补齐 Message-ID（读原 `.eml` 解析头）。
+/// 单个文件读不出来就跳过，不让一封坏邮件挡住整次归档导入。
+fn backfill_message_ids(
+    transaction: &Transaction<'_>,
+    mailbox_id: i64,
+    source_root: Option<&Path>,
+) -> StoreResult<usize> {
+    let mut statement = transaction
+        .prepare("SELECT id, eml_path FROM message WHERE mailbox_id = ?1 AND message_id = ''")?;
+    let rows = statement
+        .query_map(params![mailbox_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut filled = 0usize;
+    for (id, stored_path) in rows {
+        let path = resolve_stored_path(source_root, &stored_path);
+        let Ok(raw) = fs::read(&path) else { continue };
+        let Some(message) = MessageParser::default().parse(&raw) else {
+            continue;
+        };
+        let message_id = message.message_id().unwrap_or_default().trim().to_owned();
+        if message_id.is_empty() {
+            continue;
+        }
+        transaction.execute(
+            "UPDATE message SET message_id = ?1 WHERE id = ?2",
+            params![message_id, id],
+        )?;
+        filled += 1;
+    }
+    Ok(filled)
+}
+
+/// 归档并入哪个邮箱：该账号当前世代的收件箱（与 `mailbox_tree()` 的挑选规则一致）。
+fn inbox_mailbox_id(
+    transaction: &Transaction<'_>,
+    account: &str,
+    server: &str,
+) -> StoreResult<i64> {
+    transaction
+        .query_row(
+            "SELECT id FROM mailbox
+             WHERE account = ?1 AND server = ?2 AND source_name COLLATE NOCASE = 'INBOX'
+             ORDER BY scanned_at_unix DESC, uid_validity DESC, id DESC
+             LIMIT 1",
+            params![account, server],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| "索引里找不到收件箱，请先完成一次 IMAP 同步再导入归档".into())
+}
+
+/// 清理早期版本留下的独立归档邮箱。**先显式删 message 再删 mailbox**：直接 DELETE 一定触发
+/// `message_ad`，保证 FTS5 external content 同步，不依赖外键 cascade 是否触发 trigger。
+fn remove_archive_mailboxes(
+    transaction: &Transaction<'_>,
+    account: &str,
+    server: &str,
+) -> StoreResult<usize> {
+    let mut statement = transaction.prepare(
+        "SELECT id FROM mailbox WHERE account = ?1 AND server = ?2 AND uid_validity = ?3",
+    )?;
+    let ids = statement
+        .query_map(params![account, server, ARCHIVE_UID_VALIDITY], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for id in &ids {
+        transaction.execute("DELETE FROM message WHERE mailbox_id = ?1", params![id])?;
+        transaction.execute("DELETE FROM mailbox WHERE id = ?1", params![id])?;
+    }
+    Ok(ids.len())
+}
+
+fn list_eml_files_recursive(root: &Path) -> StoreResult<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    visit_directories(root, &mut |directory| {
+        files.extend(list_eml_files(directory)?);
+        Ok(())
+    })?;
+    files.sort();
+    Ok(files)
+}
+
 fn parse_uid(path: &Path) -> StoreResult<u32> {
     let stem = path
         .file_stem()
@@ -862,16 +1100,25 @@ fn parse_uid(path: &Path) -> StoreResult<u32> {
 }
 
 fn source_fingerprint(data_root: &Path, path: &Path) -> StoreResult<(String, i64, i64)> {
-    let metadata = fs::metadata(path)?;
     let relative = path.strip_prefix(data_root)?;
-    let normalized_path = relative.to_string_lossy().replace('\\', "/");
+    // 相对路径统一成 `/`，跨平台可比。
+    fingerprint(relative.to_string_lossy().replace('\\', "/"), path)
+}
+
+/// 归档存绝对路径，**不做分隔符替换**：Windows 绝对路径换成 `/` 后无法再打开。
+fn absolute_fingerprint(path: &Path) -> StoreResult<(String, i64, i64)> {
+    fingerprint(path.to_string_lossy().into_owned(), path)
+}
+
+fn fingerprint(stored_path: String, path: &Path) -> StoreResult<(String, i64, i64)> {
+    let metadata = fs::metadata(path)?;
     let size = i64::try_from(metadata.len())?;
     let modified = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let modified_nanos = i64::try_from(modified.as_nanos())?;
-    Ok((normalized_path, size, modified_nanos))
+    Ok((stored_path, size, modified_nanos))
 }
 
 fn format_addresses(addresses: Option<&Address<'_>>) -> String {
@@ -1070,6 +1317,7 @@ mod tests {
         sanitized_attachment_filename, sniff_image_format, AttachmentPreviewKind, MailStore,
         SniffedImageFormat,
     };
+    use rusqlite::params;
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1463,6 +1711,138 @@ AAE=\r\n\
         );
     }
 
+    #[test]
+    fn imports_loose_eml_archive_into_inbox() {
+        let root = temporary_directory("archive-backup");
+        write_mailbox(
+            &root,
+            "user@example.com",
+            "INBOX",
+            42,
+            1_700_000_000,
+            &[(1, "服务器邮件")],
+        );
+        let database = temporary_directory("archive-db").join("mail-index.sqlite");
+        let mut store = MailStore::open(&database).unwrap();
+        store.import_backup(&root).unwrap();
+
+        // 模拟早期版本留下的独立「本地归档」邮箱（uid_validity 哨兵 0），导入时必须被清掉。
+        store
+            .connection
+            .execute(
+                "INSERT INTO mailbox (
+                     account, server, source_name, display_name, uid_validity,
+                     scanned_at_unix, server_message_count, discovered_uid_count
+                 ) VALUES ('user@example.com', 'imap.example.com', '本地归档', '本地归档', 0, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        let legacy_id = store.connection.last_insert_rowid();
+        store
+            .connection
+            .execute(
+                "INSERT INTO message (
+                     mailbox_id, uid, eml_path, size_bytes, modified_unix,
+                     subject, sender, recipients, date_text, date_unix,
+                     body, html_body, attachment_count
+                 ) VALUES (?1, 1, 'legacy.eml', 1, 1, '遗留归档', '', '', NULL, NULL, '', '', 0)",
+                params![legacy_id],
+            )
+            .unwrap();
+
+        // 散装归档：文件名是主题而非 UID，且目录不在索引目录下。
+        // 第三封与已同步的服务器邮件同 Message-ID，必须按重复跳过。
+        let archive = temporary_directory("archive-loose");
+        fs::create_dir_all(archive.join("子目录")).unwrap();
+        write_loose_eml(
+            &archive.join("工程变更跟进表 1.15.eml"),
+            "工程变更跟进表",
+            "archive-1@example.com",
+        );
+        write_loose_eml(
+            &archive.join("子目录").join("Case ST0001.eml"),
+            "Faulty relay",
+            "archive-2@example.com",
+        );
+        write_loose_eml(
+            &archive.join("服务器上已有的同一封.eml"),
+            "服务器邮件",
+            "server-1@example.com",
+        );
+
+        let first = store.import_archive(&archive).unwrap();
+        assert_eq!(first.discovered_messages, 3);
+        assert_eq!(first.inserted, 2);
+        assert_eq!(first.skipped, 1, "与服务器邮件同 Message-ID 的那封必须跳过");
+
+        let accounts = store.mailbox_tree().unwrap();
+        assert_eq!(accounts.len(), 1, "归档必须挂在既有账号下，不新建账号");
+        assert!(
+            accounts[0]
+                .mailboxes
+                .iter()
+                .all(|mailbox| mailbox.display_name != "本地归档"),
+            "遗留的独立归档邮箱必须被清理"
+        );
+        let inbox = accounts[0]
+            .mailboxes
+            .iter()
+            .find(|mailbox| mailbox.source_name.eq_ignore_ascii_case("INBOX"))
+            .expect("邮箱树里应有收件箱");
+        assert_eq!(inbox.message_count, 3, "1 封服务器邮件 + 2 封归档");
+        assert_eq!(store.message_count().unwrap(), 3, "遗留归档邮件已删除");
+
+        // 归档必须存绝对路径，否则附件读取会按索引目录解析而找不到文件；
+        // UID 落在归档基址之上，不与真实 IMAP UID 相撞。
+        let page = store.message_page(inbox.id, 0, 10).unwrap();
+        assert_eq!(page.len(), 3);
+        let archived = page
+            .iter()
+            .filter(|summary| summary.uid > super::ARCHIVE_UID_BASE)
+            .count();
+        assert_eq!(archived, 2);
+        for summary in page.iter().filter(|s| s.uid > super::ARCHIVE_UID_BASE) {
+            let detail = store.message_detail(summary.id).unwrap().unwrap();
+            assert!(
+                Path::new(&detail.eml_path).is_absolute(),
+                "归档 eml_path 必须是绝对路径：{}",
+                detail.eml_path
+            );
+            assert!(Path::new(&detail.eml_path).is_file());
+        }
+
+        let hits = store.search("工程变更", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].mailbox.eq_ignore_ascii_case("INBOX") || !hits[0].mailbox.is_empty());
+
+        // 同一批文件重跑：归档行整批重建，结果稳定（inserted 恒等于去重后的数量）。
+        let second = store.import_archive(&archive).unwrap();
+        assert_eq!(second.inserted, 2);
+        assert_eq!(second.updated, 0);
+        assert_eq!(second.skipped, 1);
+        assert_eq!(store.message_count().unwrap(), 3);
+        assert_eq!(store.integrity_check().unwrap().fts5_external_content, "ok");
+    }
+
+    fn write_loose_eml(path: &Path, subject: &str, message_id: &str) {
+        fs::write(
+            path,
+            format!(
+                "From: Sender <sender@example.com>\r\n\
+To: receiver@example.com\r\n\
+Date: Mon, 17 Aug 2026 09:00:00 +0800\r\n\
+Subject: {subject}\r\n\
+Message-ID: <{message_id}>\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: 8bit\r\n\
+\r\n\
+归档正文。\r\n"
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_mailbox(
         root: &Path,
         account: &str,
@@ -1499,6 +1879,7 @@ AAE=\r\n\
 To: receiver@example.com\r\n\
 Date: Mon, 17 Aug 2026 09:00:00 +0800\r\n\
 Subject: {subject}\r\n\
+Message-ID: <server-{uid}@example.com>\r\n\
 MIME-Version: 1.0\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 Content-Transfer-Encoding: 8bit\r\n\
