@@ -336,11 +336,11 @@ impl MailApp {
         let port = account.port;
         let user = account.user.clone();
         let password = account.password.clone();
-        // 记住预期备份根目录，finish_sync 直接复用，避免重新读 DPAPI + safe_component
-        // 算的一致性（旧 last_backup_root 路径会报"未找到备份目录"）。
-        // 记住预期备份根目录，finish_sync 直接复用，避免 last_backup_root 依赖
-        // 重新读取 DPAPI + safe_component 算的一致性。须在线程 move user 之前算。
-        let expected_backup_root = backup_root.join(backup::safe_component(&user));
+        // 入库根目录必须是 data 根，不能是 <data>\<账号> 子目录：`import_backup` 按这个根算
+        // 相对 eml_path，而读取端 `MailStore::source_root` 用的是索引文件所在目录（= data 根）。
+        // 传子目录会让存库路径少一层账号目录，导致附件读取按错误路径解析。
+        // `import_backup` 会递归找 mailbox.meta.json，传 data 根同样能发现全部邮箱。
+        let import_root = backup_root.clone();
         self.sync = Some(SyncState::Connecting);
         self.onboarding = None;
         cx.notify();
@@ -399,7 +399,7 @@ impl MailApp {
                 }
             }
             this.update(cx, |this, cx| {
-                this.finish_sync_with(expected_backup_root, cx);
+                this.finish_sync_with(import_root, cx);
             })
             .ok();
         })
@@ -507,32 +507,45 @@ impl MailApp {
             return;
         }
         let index_path = self.paths.index.clone();
-        self.sync = Some(SyncState::Done {
-            backed_up: 0,
-            skipped: 0,
-        });
+        // 保留 Finished 事件带来的真实计数，别用 0/0 覆盖掉。
+        if !matches!(self.sync, Some(SyncState::Done { .. })) {
+            self.sync = Some(SyncState::Done {
+                backed_up: 0,
+                skipped: 0,
+            });
+        }
         cx.notify();
 
-        cx.background_executor()
-            .spawn(async move {
-                let result = std::thread::spawn(move || -> Result<(), String> {
-                    let mut store = MailStore::open(&index_path).map_err(|e| e.to_string())?;
-                    store
-                        .import_backup(&backup_root)
-                        .map_err(|e| e.to_string())?;
-                    Ok(())
-                })
-                .join();
-                match result {
-                    Ok(Ok(())) => Ok::<(), String>(()),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err("入库线程异常退出".to_string()),
+        let task = cx.background_executor().spawn(async move {
+            let result = std::thread::spawn(move || -> Result<(), String> {
+                let mut store = MailStore::open(&index_path).map_err(|e| e.to_string())?;
+                store
+                    .import_backup(&backup_root)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .join();
+            match result {
+                Ok(Ok(())) => Ok::<(), String>(()),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("入库线程异常退出".to_string()),
+            }
+        });
+
+        // ponytail: 必须等入库结束再 reload。之前 detach 入库后立刻 reload，
+        // 索引文件尚未建出 → 只读打开报 SQLITE_CANTOPEN(14)，明明成功却显示失败。
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => this.reload_index(cx),
+                Err(error) => {
+                    this.sync = Some(SyncState::Failed(SharedString::from(format!(
+                        "入库失败：{error}"
+                    ))));
+                    cx.notify();
                 }
             })
-            .detach();
-
-        cx.spawn(async move |this, cx| {
-            this.update(cx, |this, cx| this.reload_index(cx)).ok();
+            .ok();
         })
         .detach();
     }
@@ -733,7 +746,7 @@ impl MailApp {
                 Some(format!("新增 {backed_up} 封，跳过 {skipped} 封")),
                 false,
             ),
-            SyncState::Failed(message) => ("拉取失败".to_owned(), Some(message.to_string()), true),
+            SyncState::Failed(message) => ("同步失败".to_owned(), Some(message.to_string()), true),
         };
         let mut panel = div()
             .w(px(420.))
