@@ -18,3 +18,4 @@ Thumbs.db
 /data
 *.sqlite
 *.sqlite-journal
+.ace-tool/

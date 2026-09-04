@@ -524,12 +524,7 @@ impl MailStore {
         attachment_index: usize,
         target_path: &Path,
     ) -> StoreResult<()> {
-        let eml_path = self
-            .message_detail(message_id)?
-            .ok_or_else(|| format!("邮件不存在：id={message_id}"))?
-            .eml_path;
-        let attachment =
-            read_attachment_bytes(&self.resolve_source_path(&eml_path), attachment_index)?;
+        let attachment = self.read_attachment(message_id, attachment_index)?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -537,6 +532,18 @@ impl MailStore {
         file.write_all(&attachment)?;
         file.sync_all()?;
         Ok(())
+    }
+
+    pub fn read_attachment(
+        &self,
+        message_id: i64,
+        attachment_index: usize,
+    ) -> StoreResult<Vec<u8>> {
+        let eml_path = self
+            .message_detail(message_id)?
+            .ok_or_else(|| format!("邮件不存在：id={message_id}"))?
+            .eml_path;
+        read_attachment_bytes(&self.resolve_source_path(&eml_path), attachment_index)
     }
 
     fn resolve_source_path(&self, stored_path: &str) -> PathBuf {
@@ -949,9 +956,120 @@ pub fn sanitized_attachment_filename(filename: &str) -> String {
     name
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentPreviewKind {
+    Image,
+    Pdf,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SniffedImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Bmp,
+    Tiff,
+    Ico,
+}
+
+pub fn attachment_preview_kind(content_type: &str, filename: &str) -> AttachmentPreviewKind {
+    if resolve_image_format(content_type, filename, None).is_some() {
+        return AttachmentPreviewKind::Image;
+    }
+    let mime = normalized_mime(content_type);
+    let extension = attachment_extension(filename).to_ascii_lowercase();
+    if mime == "application/pdf" || extension == "pdf" {
+        AttachmentPreviewKind::Pdf
+    } else {
+        AttachmentPreviewKind::Unsupported
+    }
+}
+
+pub fn resolve_image_format(
+    content_type: &str,
+    filename: &str,
+    bytes: Option<&[u8]>,
+) -> Option<SniffedImageFormat> {
+    bytes
+        .and_then(sniff_image_format)
+        .or_else(|| image_format_from_mime(content_type))
+        .or_else(|| image_format_from_extension(filename))
+}
+
+fn normalized_mime(content_type: &str) -> &str {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+}
+
+fn attachment_extension(filename: &str) -> &str {
+    filename
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+        .unwrap_or("")
+}
+
+fn image_format_from_mime(content_type: &str) -> Option<SniffedImageFormat> {
+    match normalized_mime(content_type).to_ascii_lowercase().as_str() {
+        "image/png" => Some(SniffedImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(SniffedImageFormat::Jpeg),
+        "image/gif" => Some(SniffedImageFormat::Gif),
+        "image/webp" => Some(SniffedImageFormat::Webp),
+        "image/bmp" | "image/x-ms-bmp" => Some(SniffedImageFormat::Bmp),
+        "image/tiff" | "image/tif" => Some(SniffedImageFormat::Tiff),
+        "image/ico" | "image/x-icon" | "image/vnd.microsoft.icon" => Some(SniffedImageFormat::Ico),
+        _ => None,
+    }
+}
+
+fn image_format_from_extension(filename: &str) -> Option<SniffedImageFormat> {
+    match attachment_extension(filename).to_ascii_lowercase().as_str() {
+        "png" => Some(SniffedImageFormat::Png),
+        "jpg" | "jpeg" => Some(SniffedImageFormat::Jpeg),
+        "gif" => Some(SniffedImageFormat::Gif),
+        "webp" => Some(SniffedImageFormat::Webp),
+        "bmp" => Some(SniffedImageFormat::Bmp),
+        "tif" | "tiff" => Some(SniffedImageFormat::Tiff),
+        "ico" => Some(SniffedImageFormat::Ico),
+        _ => None,
+    }
+}
+
+fn sniff_image_format(bytes: &[u8]) -> Option<SniffedImageFormat> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some(SniffedImageFormat::Png)
+    } else if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        Some(SniffedImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(SniffedImageFormat::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(SniffedImageFormat::Webp)
+    } else if bytes.starts_with(b"BM") {
+        Some(SniffedImageFormat::Bmp)
+    } else if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+        || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
+        Some(SniffedImageFormat::Tiff)
+    } else if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        Some(SniffedImageFormat::Ico)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{read_attachment_metadata, sanitized_attachment_filename, MailStore};
+    use super::{
+        attachment_preview_kind, read_attachment_metadata, resolve_image_format,
+        sanitized_attachment_filename, sniff_image_format, AttachmentPreviewKind, MailStore,
+        SniffedImageFormat,
+    };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1301,6 +1419,47 @@ AAE=\r\n\
         assert_eq!(
             sanitized_attachment_filename("报告\x08最终版.docx"),
             "报告最终版.docx"
+        );
+    }
+
+    #[test]
+    fn classifies_attachment_preview_kind_from_mime_and_filename() {
+        assert_eq!(
+            attachment_preview_kind("image/png", "photo.png"),
+            AttachmentPreviewKind::Image
+        );
+        assert_eq!(
+            attachment_preview_kind("application/octet-stream", "scan.JPG"),
+            AttachmentPreviewKind::Image
+        );
+        assert_eq!(
+            attachment_preview_kind("application/pdf", "合同.pdf"),
+            AttachmentPreviewKind::Pdf
+        );
+        assert_eq!(
+            attachment_preview_kind("application/octet-stream", "notes.pdf"),
+            AttachmentPreviewKind::Pdf
+        );
+        assert_eq!(
+            attachment_preview_kind("application/msword", "a.doc"),
+            AttachmentPreviewKind::Unsupported
+        );
+        assert_eq!(
+            sniff_image_format(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00]),
+            Some(SniffedImageFormat::Png)
+        );
+        assert_eq!(
+            sniff_image_format(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(SniffedImageFormat::Jpeg)
+        );
+        assert_eq!(sniff_image_format(b"%PDF-1.4"), None);
+        assert_eq!(
+            resolve_image_format(
+                "application/octet-stream",
+                "x.bin",
+                Some(&[0xFF, 0xD8, 0xFF])
+            ),
+            Some(SniffedImageFormat::Jpeg)
         );
     }
 

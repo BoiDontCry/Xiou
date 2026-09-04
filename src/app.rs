@@ -1,18 +1,21 @@
 use foxmail_imap::account_config::{self, AccountConfig};
 use foxmail_imap::backup::{self, BackupOptions};
 use foxmail_imap::mail_store::{
-    sanitized_attachment_filename, AttachmentMeta, MailStore, MailboxAccount, MessageDetail,
-    MessageSummary, SearchHit,
+    attachment_preview_kind, resolve_image_format, sanitized_attachment_filename, AttachmentMeta,
+    AttachmentPreviewKind, MailStore, MailboxAccount, MessageDetail, MessageSummary, SearchHit,
+    SniffedImageFormat,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, relative, uniform_list, AnyElement, AppContext, Context, Entity, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, ScrollStrategy, SharedString,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    div, hsla, img, px, relative, uniform_list, AnyElement, AppContext, Context, Entity, Image,
+    ImageFormat, InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledImage,
+    UniformListScrollHandle, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::composer_editor::{ComposerEvent, ComposerInput, ComposerInputOptions};
@@ -51,6 +54,8 @@ pub struct MailApp {
     paths: AppPaths,
     onboarding: Option<Onboarding>,
     sync: Option<SyncState>,
+    preview: Option<PreviewState>,
+    preview_generation: usize,
 }
 
 struct Onboarding {
@@ -96,6 +101,25 @@ enum SaveState {
     Done(SharedString),
     Failed(SharedString),
 }
+
+enum PreviewState {
+    Loading {
+        filename: SharedString,
+    },
+    Image {
+        filename: SharedString,
+        image: Arc<Image>,
+    },
+    Pdf {
+        filename: SharedString,
+    },
+    Failed {
+        filename: SharedString,
+        error: SharedString,
+    },
+}
+
+const MAX_IMAGE_PREVIEW_BYTES: usize = 20 * 1024 * 1024;
 
 impl MailApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -184,6 +208,8 @@ impl MailApp {
             paths,
             onboarding,
             sync: None,
+            preview: None,
+            preview_generation: 0,
         }
     }
 
@@ -530,6 +556,7 @@ impl MailApp {
                 self.message_pages.clear();
                 self.selected_message = None;
                 self.selected_detail = None;
+                self.preview = None;
             }
             Err(error) => {
                 let problem = classify_index_error(error.as_ref());
@@ -840,6 +867,211 @@ impl MailApp {
         .detach();
     }
 
+    fn start_attachment_preview(
+        &mut self,
+        message_id: i64,
+        attachment_index: usize,
+        filename: String,
+        content_type: String,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.preview, Some(PreviewState::Loading { .. })) {
+            return;
+        }
+        let display_name = nonempty_label(&filename, "未命名附件");
+        match attachment_preview_kind(&content_type, &filename) {
+            AttachmentPreviewKind::Pdf => {
+                self.preview = Some(PreviewState::Pdf {
+                    filename: SharedString::from(display_name),
+                });
+                cx.notify();
+                return;
+            }
+            AttachmentPreviewKind::Unsupported => {
+                self.preview = Some(PreviewState::Failed {
+                    filename: SharedString::from(display_name),
+                    error: "该类型暂不支持预览，请先保存到本地打开".into(),
+                });
+                cx.notify();
+                return;
+            }
+            AttachmentPreviewKind::Image => {}
+        }
+        if self.store.is_none() {
+            self.preview = Some(PreviewState::Failed {
+                filename: SharedString::from(display_name),
+                error: "邮件索引未打开".into(),
+            });
+            cx.notify();
+            return;
+        }
+
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        let generation = self.preview_generation;
+        self.preview = Some(PreviewState::Loading {
+            filename: SharedString::from(display_name.clone()),
+        });
+        cx.notify();
+
+        let index_path = self.paths.index.clone();
+        let task = cx.background_executor().spawn(async move {
+            let store =
+                MailStore::open_read_only(&index_path).map_err(|error| error.to_string())?;
+            let bytes = store
+                .read_attachment(message_id, attachment_index)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > MAX_IMAGE_PREVIEW_BYTES {
+                return Err(format!(
+                    "附件过大（{}），超过 20 MiB 预览上限",
+                    format_bytes(bytes.len() as u64)
+                ));
+            }
+            let format = resolve_image_format(&content_type, &filename, Some(&bytes))
+                .ok_or_else(|| "无法识别图片格式".to_owned())?;
+            Ok(Arc::new(Image::from_bytes(
+                gpui_image_format(format),
+                bytes,
+            )))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.preview_generation != generation {
+                    return;
+                }
+                this.preview = Some(match result {
+                    Ok(image) => PreviewState::Image {
+                        filename: SharedString::from(display_name),
+                        image,
+                    },
+                    Err(error) => PreviewState::Failed {
+                        filename: SharedString::from(display_name),
+                        error: SharedString::from(error),
+                    },
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview = None;
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn render_preview_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let preview = self.preview.as_ref()?;
+        let theme = self.theme;
+        let (title, body): (SharedString, AnyElement) = match preview {
+            PreviewState::Loading { filename } => (
+                filename.clone(),
+                div()
+                    .text_color(theme.text_secondary)
+                    .text_sm()
+                    .child("正在解码图片…")
+                    .into_any_element(),
+            ),
+            PreviewState::Image { filename, image } => (
+                filename.clone(),
+                img(image.clone())
+                    .object_fit(ObjectFit::Contain)
+                    .max_w(relative(1.))
+                    .max_h(relative(1.))
+                    .with_fallback(move || {
+                        div()
+                            .text_color(theme.accent)
+                            .text_sm()
+                            .child("图片解码失败")
+                            .into_any_element()
+                    })
+                    .into_any_element(),
+            ),
+            PreviewState::Pdf { filename } => (
+                filename.clone(),
+                div()
+                    .max_w(px(420.))
+                    .text_color(theme.text_secondary)
+                    .text_sm()
+                    .child("PDF 暂不内联预览，请保存后用系统阅读器打开。")
+                    .into_any_element(),
+            ),
+            PreviewState::Failed { filename, error } => (
+                filename.clone(),
+                div()
+                    .max_w(px(420.))
+                    .text_color(theme.accent)
+                    .text_sm()
+                    .child(error.clone())
+                    .into_any_element(),
+            ),
+        };
+
+        Some(
+            div()
+                .id("attachment-preview-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .bg(hsla(0.0, 0.0, 0.0, 0.72))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_preview(cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_4()
+                        .py_3()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text)
+                                .text_sm()
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .id("attachment-preview-close")
+                                .px_2()
+                                .py_1()
+                                .rounded(px(4.))
+                                .bg(theme.raised)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.active))
+                                .text_color(theme.text_secondary)
+                                .text_xs()
+                                .child("关闭")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.close_preview(cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_6()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(body),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn toggle_account(&mut self, key: String, cx: &mut Context<Self>) {
         if !self.collapsed_accounts.remove(&key) {
             self.collapsed_accounts.insert(key);
@@ -861,6 +1093,7 @@ impl MailApp {
             self.selected_detail = None;
             self.detail_load_error = None;
             self.save_state = None;
+            self.preview = None;
             self.body_scroll.set_offset(Default::default());
             if self.selected_count() > 0 {
                 self.message_scroll
@@ -887,6 +1120,7 @@ impl MailApp {
             self.selected_message = None;
             self.selected_detail = None;
             self.detail_load_error = None;
+            self.preview = None;
             self.body_scroll.set_offset(Default::default());
         }
         self.select_message(message_id, cx);
@@ -1010,6 +1244,7 @@ impl MailApp {
         self.selected_detail = None;
         self.detail_load_error = None;
         self.save_state = None;
+        self.preview = None;
         self.body_scroll.set_offset(Default::default());
         match self.store.as_ref().map(|store| store.message_detail(id)) {
             Some(Ok(Some(detail))) => {
@@ -1799,13 +2034,16 @@ impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.onboarding.is_some() || self.sync.is_some() {
             return div()
+                .relative()
                 .size_full()
                 .overflow_hidden()
                 .bg(self.theme.canvas)
                 .text_color(self.theme.text)
                 .child(self.render_onboarding_or_sync(window, cx));
         }
+        let overlay = self.render_preview_overlay(cx);
         div()
+            .relative()
             .size_full()
             .overflow_hidden()
             .bg(self.theme.canvas)
@@ -1814,6 +2052,7 @@ impl Render for MailApp {
             .child(self.render_sidebar(cx))
             .child(self.render_message_list(cx, window))
             .child(self.render_reader(cx, window))
+            .when_some(overlay, |this, overlay| this.child(overlay))
     }
 }
 
@@ -2298,26 +2537,57 @@ impl MailApp {
                     )
                     .child(
                         div()
-                            .id(("attachment-save", index))
                             .flex_shrink_0()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(4.))
-                            .bg(theme.raised)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.active))
-                            .text_color(theme.text_secondary)
-                            .text_xs()
-                            .child("保存")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.start_attachment_save(
-                                    message_id,
-                                    index,
-                                    save_target.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })),
+                            .flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(("attachment-preview", index))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(4.))
+                                    .bg(theme.raised)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme.active))
+                                    .text_color(theme.text_secondary)
+                                    .text_xs()
+                                    .child("预览")
+                                    .on_click(cx.listener({
+                                        let preview_name = attachment.filename.clone();
+                                        let preview_type = attachment.content_type.clone();
+                                        move |this, _, _, cx| {
+                                            this.start_attachment_preview(
+                                                message_id,
+                                                index,
+                                                preview_name.clone(),
+                                                preview_type.clone(),
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("attachment-save", index))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(4.))
+                                    .bg(theme.raised)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme.active))
+                                    .text_color(theme.text_secondary)
+                                    .text_xs()
+                                    .child("保存")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_attachment_save(
+                                            message_id,
+                                            index,
+                                            save_target.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
                     ),
             );
         }
@@ -2341,6 +2611,18 @@ fn format_bytes(bytes: u64) -> String {
 
 fn format_attachment_bytes(bytes: usize) -> String {
     format_bytes(bytes as u64)
+}
+
+fn gpui_image_format(format: SniffedImageFormat) -> ImageFormat {
+    match format {
+        SniffedImageFormat::Png => ImageFormat::Png,
+        SniffedImageFormat::Jpeg => ImageFormat::Jpeg,
+        SniffedImageFormat::Gif => ImageFormat::Gif,
+        SniffedImageFormat::Webp => ImageFormat::Webp,
+        SniffedImageFormat::Bmp => ImageFormat::Bmp,
+        SniffedImageFormat::Tiff => ImageFormat::Tiff,
+        SniffedImageFormat::Ico => ImageFormat::Ico,
+    }
 }
 
 fn normalize_plain_body(value: &str) -> String {
