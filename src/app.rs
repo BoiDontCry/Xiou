@@ -121,6 +121,9 @@ enum PreviewState {
 
 const MAX_IMAGE_PREVIEW_BYTES: usize = 20 * 1024 * 1024;
 
+// ponytail: 固定 10 分钟轮询，不做可配置项；嫌慢或嫌费电时再加设置。
+const BACKGROUND_SYNC_INTERVAL_SECS: u64 = 600;
+
 impl MailApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| {
@@ -182,7 +185,7 @@ impl MailApp {
             .next()
             .map(|mailbox| mailbox.id);
 
-        Self {
+        let mut app = Self {
             theme: Theme::dark(),
             store,
             accounts,
@@ -210,7 +213,13 @@ impl MailApp {
             sync: None,
             preview: None,
             preview_generation: 0,
+        };
+        if app.onboarding.is_none() {
+            // 启动即拉一次新邮件，之后交给固定间隔轮询。
+            app.maybe_start_background_sync(cx);
+            app.schedule_background_sync(cx);
         }
+        app
     }
 
     fn build_onboarding(
@@ -323,7 +332,6 @@ impl MailApp {
                 return;
             }
         };
-        let backup_root = self.backup_root_for(&account);
         if let Err(error) = account_config::save(&account) {
             self.update_onboarding_error(
                 Some(SharedString::from(format!("保存账号配置失败：{error}"))),
@@ -331,7 +339,47 @@ impl MailApp {
             );
             return;
         }
+        self.onboarding = None;
+        self.run_sync_pipeline(account, cx);
+    }
 
+    /// 后台轮询入口：已有配置且当前空闲时自动拉新邮件。
+    fn maybe_start_background_sync(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding.is_some() {
+            return;
+        }
+        // 同步进行中（含入库/重载段）不重叠开新一轮；Done/Failed 视为空闲。
+        if self
+            .sync
+            .as_ref()
+            .is_some_and(|s| !matches!(s, SyncState::Done { .. } | SyncState::Failed(_)))
+        {
+            return;
+        }
+        let Ok(account) = account_config::load() else {
+            return; // 配置缺失或读取失败，静默跳过，下一轮再试
+        };
+        let Some(account) = account else {
+            return;
+        };
+        self.run_sync_pipeline(account, cx);
+    }
+
+    /// 启动后立即同步一次，之后按固定间隔轮询。
+    fn schedule_background_sync(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(BACKGROUND_SYNC_INTERVAL_SECS))
+                .await;
+            this.update(cx, |this, cx| this.maybe_start_background_sync(cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// 手动（onboarding）与后台轮询共用的同步执行段：IMAP 拉取（后台线程）→ 事件泵 → 入库。
+    fn run_sync_pipeline(&mut self, account: AccountConfig, cx: &mut Context<Self>) {
+        let backup_root = self.backup_root_for(&account);
         let host = account.host.clone();
         let port = account.port;
         let user = account.user.clone();
@@ -342,7 +390,6 @@ impl MailApp {
         // `import_backup` 会递归找 mailbox.meta.json，传 data 根同样能发现全部邮箱。
         let import_root = backup_root.clone();
         self.sync = Some(SyncState::Connecting);
-        self.onboarding = None;
         cx.notify();
 
         let (progress_tx, progress_rx) = std::sync::mpsc::channel::<backup::ProgressEvent>();
@@ -513,6 +560,17 @@ impl MailApp {
                 backed_up: 0,
                 skipped: 0,
             });
+        }
+        // 后台轮询没拉到新邮件时索引未变，跳过 reload——reload 会清空选中邮件/分页缓存，
+        // 会把用户正在读的邮件踢回列表首封。store 尚未加载（首次 onboarding 同步）除外。
+        let backed_up = match &self.sync {
+            Some(SyncState::Done { backed_up, .. }) => *backed_up,
+            _ => 0,
+        };
+        if backed_up == 0 && self.store.is_some() {
+            self.sync = None;
+            cx.notify();
+            return;
         }
         cx.notify();
 
