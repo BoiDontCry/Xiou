@@ -8,7 +8,7 @@ use crate::imap_config::{HOST, PORT, USER};
 use crate::imap_errors::login_error;
 use imap::{ClientBuilder, Session};
 use imap_proto::NameAttribute;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -208,6 +208,31 @@ struct MailboxMetadata<'a> {
     scanned_at_unix: u64,
     server_message_count: u32,
     discovered_uid_count: usize,
+    last_uid: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct MailboxMetadataFile {
+    #[serde(default)]
+    last_uid: Option<u32>,
+}
+
+fn uid_search_criteria(last_uid: Option<u32>) -> String {
+    match last_uid {
+        Some(uid) if uid < u32::MAX => format!("UID {}:*", uid + 1),
+        _ => "ALL".to_owned(),
+    }
+}
+
+fn read_last_uid(mailbox_root: &Path) -> Option<u32> {
+    let bytes = fs::read(mailbox_root.join("mailbox.meta.json")).ok()?;
+    serde_json::from_slice::<MailboxMetadataFile>(&bytes)
+        .ok()?
+        .last_uid
+}
+
+fn has_local_eml(final_path: &Path) -> bool {
+    final_path.is_file()
 }
 
 /// 用默认账号（imap_config 常量）+ 环境变量/DPAPI 密码跑全量备份。
@@ -248,7 +273,15 @@ pub fn run_backup_with(
         let uid_validity = mailbox
             .uid_validity
             .ok_or_else(|| format!("邮箱 {mailbox_name} 未返回 UIDVALIDITY"))?;
-        let mut uids: Vec<u32> = session.uid_search("ALL")?.into_iter().collect();
+
+        let mailbox_root = account_root
+            .join(safe_component(&mailbox_name))
+            .join(format!("uidvalidity-{uid_validity}"));
+        let last_uid = read_last_uid(&mailbox_root);
+        let mut uids: Vec<u32> = session
+            .uid_search(uid_search_criteria(last_uid))?
+            .into_iter()
+            .collect();
         uids.sort_unstable();
 
         if let Some(limit) = options.max_messages {
@@ -259,42 +292,27 @@ pub fn run_backup_with(
 
         progress.mailbox_start(&mailbox_name, mailbox.exists, uids.len());
 
-        let mailbox_root = account_root
-            .join(safe_component(&mailbox_name))
-            .join(format!("uidvalidity-{uid_validity}"));
-
         if !options.dry_run {
             fs::create_dir_all(&mailbox_root)?;
-            write_metadata(
-                &mailbox_root,
-                &MailboxMetadata {
-                    account: user,
-                    server: host,
-                    mailbox: &mailbox_name,
-                    uid_validity,
-                    scanned_at_unix: unix_now(),
-                    server_message_count: mailbox.exists,
-                    discovered_uid_count: uids.len(),
-                },
-            )?;
         }
 
         let mut mailbox_backed_up = 0usize;
         let mut mailbox_skipped = 0usize;
 
-        for uid in uids {
-            let size = fetch_size(&mut session, uid)?;
+        for uid in &uids {
+            let uid = *uid;
             let final_path = mailbox_root.join(format!("{uid:010}.eml"));
 
-            if final_path.exists() && final_path.metadata()?.len() == u64::from(size) {
-                progress.message_skipped(uid, u64::from(size));
+            // 本地已有完整 eml：旧信不打 SIZE、不重下。
+            if has_local_eml(&final_path) {
                 mailbox_skipped += 1;
                 total_skipped += 1;
                 continue;
             }
 
+            let size = fetch_size(&mut session, uid)?;
+
             if options.dry_run {
-                // dry-run 不下载，按"已计划"计入跳过以保持计数一致
                 mailbox_skipped += 1;
                 total_skipped += 1;
                 continue;
@@ -310,6 +328,23 @@ pub fn run_backup_with(
             )?;
             mailbox_backed_up += 1;
             total_backed_up += 1;
+        }
+
+        if !options.dry_run {
+            let next_last_uid = uids.last().copied().or(last_uid);
+            write_metadata(
+                &mailbox_root,
+                &MailboxMetadata {
+                    account: user,
+                    server: host,
+                    mailbox: &mailbox_name,
+                    uid_validity,
+                    scanned_at_unix: unix_now(),
+                    server_message_count: mailbox.exists,
+                    discovered_uid_count: uids.len(),
+                    last_uid: next_last_uid,
+                },
+            )?;
         }
 
         progress.mailbox_done(&mailbox_name, mailbox_backed_up, mailbox_skipped);
@@ -499,6 +534,25 @@ mod tests {
         assert!(!value.contains('/'));
         assert!(!value.contains(':'));
         assert_eq!(value, safe_component("Sent/项目:2026"));
+    }
+
+    #[test]
+    fn uid_search_is_incremental_after_last_uid() {
+        assert_eq!(uid_search_criteria(None), "ALL");
+        assert_eq!(uid_search_criteria(Some(0)), "UID 1:*");
+        assert_eq!(uid_search_criteria(Some(100)), "UID 101:*");
+        assert_eq!(uid_search_criteria(Some(u32::MAX)), "ALL");
+    }
+
+    #[test]
+    fn local_eml_counts_as_already_backed_up() {
+        let dir = std::env::temp_dir().join(format!("foxmail-rs-eml-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0000000042.eml");
+        assert!(!has_local_eml(&path));
+        fs::write(&path, b"From: test\r\n\r\n").unwrap();
+        assert!(has_local_eml(&path));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
