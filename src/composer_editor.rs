@@ -1,7 +1,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    actions, div, fill, hsla, point, px, size, App, Bounds, ClipboardItem, Context, CursorStyle,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    actions, div, fill, point, px, size, App, Bounds, ClipboardItem, Context, CursorStyle, Element,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
     Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
@@ -115,7 +115,7 @@ impl ComposerInput {
         initial: String,
         options: ComposerInputOptions,
     ) -> Self {
-        let focus_handle = cx.focus_handle();
+        let focus_handle = cx.focus_handle().tab_stop(true);
         let _ = cx.on_focus(&focus_handle, window, |this, _, cx| {
             this.cursor_epoch += 1;
             this.blink(this.cursor_epoch, cx);
@@ -520,7 +520,7 @@ impl EventEmitter<ComposerEvent> for ComposerInput {}
 
 impl Render for ComposerInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+        let theme = Theme::from_env();
         let on_key = cx.listener(|this, event: &KeyDownEvent, _window, cx| {
             let modifiers = &event.keystroke.modifiers;
             let key = event.keystroke.key.as_str();
@@ -542,7 +542,11 @@ impl Render for ComposerInput {
             .cursor(CursorStyle::IBeam)
             .flex_1()
             .min_h_0()
-            .min_h(if self.single_line { px(24.0) } else { px(96.0) })
+            .min_h(if self.single_line {
+                gpui::rems(1.5)
+            } else {
+                gpui::rems(6.0)
+            })
             .w_full()
             .when(self.single_line, |element| element.px_1())
             .when(!self.single_line, |element| {
@@ -553,7 +557,7 @@ impl Render for ComposerInput {
             })
             .text_color(theme.text)
             .text_sm()
-            .line_height(px(22.0))
+            .line_height(gpui::rems(1.375))
             .on_action(cx.listener(ComposerInput::backspace))
             .on_action(cx.listener(ComposerInput::delete))
             .on_action(cx.listener(ComposerInput::left))
@@ -696,7 +700,7 @@ fn build_styled_text(input: &ComposerInput, window: &Window) -> StyledText {
         TextRun {
             len: text.len(),
             font: style.font(),
-            color: Theme::dark().text_tertiary,
+            color: Theme::from_env().text_tertiary,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -707,7 +711,7 @@ fn build_styled_text(input: &ComposerInput, window: &Window) -> StyledText {
             font: style.font(),
             color: style.color,
             background_color: if !input.selected_range.is_empty() {
-                Some(hsla(0.0, 0.0, 1.0, 0.18))
+                Some(Theme::from_env().active)
             } else {
                 None
             },

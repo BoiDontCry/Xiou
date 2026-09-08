@@ -12,6 +12,7 @@ mod draft_store;
 mod paths;
 mod save_dialog;
 mod theme;
+mod ui;
 
 fn main() {
     application().run(|app: &mut App| {
@@ -31,6 +32,26 @@ fn main() {
             KeyBinding::new("home", composer_editor::Home, None),
             KeyBinding::new("end", composer_editor::End, None),
             KeyBinding::new("enter", composer_editor::Newline, None),
+            KeyBinding::new("escape", compose_window::CloseCompose, Some("Compose")),
+            KeyBinding::new("ctrl-enter", compose_window::SendCompose, Some("Compose")),
+            KeyBinding::new("escape", app::ClosePreview, Some("Preview")),
+            KeyBinding::new("escape", app::DismissOverlay, Some("MailApp")),
+            KeyBinding::new("ctrl-n", app::Compose, Some("MailApp")),
+            KeyBinding::new("ctrl-r", app::Reply, Some("MailApp")),
+            KeyBinding::new("ctrl-shift-f", app::Forward, Some("MailApp")),
+            KeyBinding::new("ctrl-f", app::OpenSearch, Some("MailApp")),
+            KeyBinding::new("ctrl-shift-s", app::SyncNow, Some("MailApp")),
+            KeyBinding::new("ctrl-b", app::ToggleSidebar, Some("MailApp")),
+            KeyBinding::new("down", app::NextMessage, Some("MessageList")),
+            KeyBinding::new("up", app::PrevMessage, Some("MessageList")),
+            KeyBinding::new("j", app::NextMessage, Some("MessageList")),
+            KeyBinding::new("k", app::PrevMessage, Some("MessageList")),
+            KeyBinding::new("enter", app::ConfirmSelection, Some("MessageList")),
+            KeyBinding::new("down", app::NextMailbox, Some("MailboxList")),
+            KeyBinding::new("up", app::PrevMailbox, Some("MailboxList")),
+            KeyBinding::new("j", app::NextMailbox, Some("MailboxList")),
+            KeyBinding::new("k", app::PrevMailbox, Some("MailboxList")),
+            KeyBinding::new("enter", app::ConfirmSelection, Some("MailboxList")),
         ]);
 
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), app);

@@ -1,12 +1,14 @@
 use crate::composer_editor::{ComposerEvent, ComposerInput, ComposerInputOptions};
 use crate::draft_store::{self, DraftData};
 use crate::theme::Theme;
+use crate::ui::{control_button, rems, ButtonKind};
 use foxmail_imap::credentials;
 use foxmail_imap::mail_store::MessageDetail;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     actions, div, px, size, App, AppContext, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, Window, WindowBounds, WindowOptions,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowBounds, WindowOptions,
 };
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
@@ -16,7 +18,7 @@ pub const SMTP_HOST: &str = "smtp.yunyou.top";
 pub const SMTP_PORT: u16 = 465;
 pub const FROM_ADDR: &str = "zhangwei@szshuori.com";
 
-actions!(compose, [CloseCompose]);
+actions!(compose, [CloseCompose, SendCompose]);
 
 #[derive(Clone, Debug)]
 pub enum ComposeKind {
@@ -116,7 +118,7 @@ impl ComposeWindow {
                     ];
                     window.focus(&to.read(cx).focus_handle(), cx);
                     Self {
-                        theme: Theme::dark(),
+                        theme: Theme::from_env(),
                         kind,
                         to,
                         cc,
@@ -187,6 +189,10 @@ impl ComposeWindow {
         window.remove_window();
     }
 
+    fn send_from_action(&mut self, _: &SendCompose, _: &mut Window, cx: &mut Context<Self>) {
+        self.attempt_send(cx);
+    }
+
     fn render_header_field(
         &self,
         theme: Theme,
@@ -195,7 +201,7 @@ impl ComposeWindow {
     ) -> impl IntoElement {
         let label_text: SharedString = label.to_owned().into();
         div()
-            .h(px(36.))
+            .h(rems(2.25))
             .px_3()
             .flex()
             .items_center()
@@ -205,7 +211,7 @@ impl ComposeWindow {
             .hover(|style| style.bg(theme.raised))
             .child(
                 div()
-                    .w(px(56.))
+                    .w(rems(3.5))
                     .flex_shrink_0()
                     .text_color(theme.text_tertiary)
                     .text_xs()
@@ -217,6 +223,12 @@ impl ComposeWindow {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let sending = matches!(self.send_state, SendState::Sending);
+        let status_color = match &self.send_state {
+            SendState::Idle => theme.text_tertiary,
+            SendState::Sending => theme.info,
+            SendState::Success(_) => theme.success,
+            SendState::Failed(_) => theme.danger,
+        };
         let status: SharedString = match &self.send_state {
             SendState::Idle => "Ctrl/Cmd+Enter 发送 · Esc 关闭".into(),
             SendState::Sending => "正在发送…".into(),
@@ -224,7 +236,7 @@ impl ComposeWindow {
             SendState::Failed(error) => format!("发送失败：{}", error).into(),
         };
         div()
-            .h(px(48.))
+            .h(rems(3.))
             .px_4()
             .flex()
             .items_center()
@@ -237,29 +249,16 @@ impl ComposeWindow {
                     .items_center()
                     .gap_3()
                     .child(
-                        div()
-                            .id("send-button")
-                            .px_3()
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(4.))
-                            .bg(theme.accent)
-                            .text_color(gpui::hsla(0., 0., 0., 1.))
+                        control_button("send-button", theme, ButtonKind::Primary, sending)
+                            .h(rems(1.875))
+                            .px(rems(0.75))
                             .text_sm()
-                            .when(sending, |el| el.opacity(0.5))
                             .child(if sending { "发送中…" } else { "发送" })
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.attempt_send(cx)),
-                            ),
+                            .when(!sending, |el| {
+                                el.on_click(cx.listener(|this, _, _, cx| this.attempt_send(cx)))
+                            }),
                     )
-                    .child(
-                        div()
-                            .text_color(theme.text_tertiary)
-                            .text_xs()
-                            .child(status),
-                    ),
+                    .child(div().text_color(status_color).text_xs().child(status)),
             )
     }
 }
@@ -274,7 +273,9 @@ impl Render for ComposeWindow {
 
         div()
             .size_full()
+            .key_context("Compose")
             .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::send_from_action))
             .bg(theme.canvas)
             .text_color(theme.text)
             .flex()
@@ -292,7 +293,7 @@ impl Render for ComposeWindow {
             )
             .child(
                 div()
-                    .h(px(28.))
+                    .h(rems(1.75))
                     .px_4()
                     .flex()
                     .items_center()
