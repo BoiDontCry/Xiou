@@ -19,7 +19,7 @@ pub fn prompt_save_path(window: &Window, suggested_filename: &str) -> Option<Pat
     unsafe { show_dialog(hwnd, suggested_filename) }.ok()
 }
 
-fn native_hwnd(window: &Window) -> Option<HWND> {
+pub(crate) fn native_hwnd(window: &Window) -> Option<HWND> {
     let handle = HasWindowHandle::window_handle(window).ok()?;
     if let RawWindowHandle::Win32(win32) = handle.as_raw() {
         Some(HWND(win32.hwnd.get() as *mut _))

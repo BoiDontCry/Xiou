@@ -34,7 +34,9 @@ path = "src/smtp_send.rs"
 [dependencies]
 imap = "3.0.0-alpha.15"
 imap-proto = "0.16.7"
-mail-parser = "0.9"
+mail-parser = { version = "0.9", features = ["full_encoding"] }
+ammonia = "4"
+native-tls = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -43,6 +45,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_Console",
+    "Win32_System_Registry",
 ] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 raw-window-handle = "0.6"
@@ -51,7 +54,9 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+tray-icon = { version = "0.24", default-features = false }
 gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview" }
 gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = ["font-kit"] }
 

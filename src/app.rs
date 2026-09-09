@@ -2,15 +2,16 @@ use foxmail_imap::account_config::{self, AccountConfig};
 use foxmail_imap::backup::{self, BackupOptions};
 use foxmail_imap::mail_store::{
     attachment_preview_kind, resolve_image_format, sanitized_attachment_filename, AttachmentMeta,
-    AttachmentPreviewKind, MailStore, MailboxAccount, MessageDetail, MessageSummary, SearchHit,
-    SniffedImageFormat,
+    AttachmentPayload, AttachmentPreviewKind, MailStore, MailboxAccount, MailboxSummary,
+    MessageDetail, MessageSummary, SearchHit, SniffedImageFormat, StoreResult,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    actions, div, img, relative, uniform_list, AnyElement, AppContext, Context, Entity,
-    FocusHandle, Image, ImageFormat, InteractiveElement, IntoElement, MouseButton, ObjectFit,
-    ParentElement, Render, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement,
-    Styled, StyledImage, UniformListScrollHandle, Window,
+    actions, div, img, list, px, relative, rgb, uniform_list, AnyElement, AppContext, Context,
+    CursorStyle, DragMoveEvent, Empty, Entity, FocusHandle, Image, ImageFormat,
+    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, ObjectFit,
+    ParentElement, Render, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, UniformListScrollHandle, Window,
 };
 
 use crate::ui::{control_button, rems, step_index, tooltip, ButtonKind};
@@ -31,6 +32,7 @@ actions!(
         ConfirmSelection,
         ToggleSidebar,
         SyncNow,
+        OpenSettings,
     ]
 );
 use std::collections::{HashMap, HashSet};
@@ -45,12 +47,25 @@ use crate::diagnostics::{
     IndexProblem,
 };
 use crate::paths::{index_is_missing, AppPaths};
+use crate::prefs::{
+    self, format_hex, hsv_to_rgb, parse_hex, rgb_to_hsv, ColorScheme, Palette, Prefs, TokenId,
+    TokenSet, WorkspaceMode,
+};
 use crate::theme::Theme;
+use foxmail_imap::html::{self, BodyBlock, InlineSpan};
 
 const MESSAGE_PAGE_SIZE: usize = 50;
+const ATTACHMENT_PANE_DEFAULT_REM: f32 = 6.0;
+const ATTACHMENT_PANE_MIN_REM: f32 = 4.0;
+const ATTACHMENT_PANE_MAX_REM: f32 = 28.0;
+const SEARCH_DROPDOWN_MAX_REM: f32 = 12.0;
+const COMPACT_WIDTH_REM: f32 = 48.0;
 
 pub struct MailApp {
     theme: Theme,
+    prefs: Prefs,
+    settings: Option<SettingsSession>,
+    workspace_pane: WorkspacePane,
     store: Option<MailStore>,
     accounts: Vec<MailboxAccount>,
     selected_mailbox: Option<i64>,
@@ -61,8 +76,15 @@ pub struct MailApp {
     message_load_error: Option<SharedString>,
     message_scroll: UniformListScrollHandle,
     body_scroll: ScrollHandle,
+    attachment_scroll: ScrollHandle,
+    attachment_pane_rem: f32,
+    split_drag_y: Option<f32>,
     selected_message: Option<i64>,
     selected_detail: Option<MessageDetail>,
+    selected_body_cids: Arc<HashMap<String, Arc<Image>>>,
+    selected_body_blocks: Arc<Vec<BodyBlock>>,
+    body_list: ListState,
+    detail_generation: usize,
     detail_load_error: Option<SharedString>,
     search_query: String,
     search_results: Vec<SearchHit>,
@@ -84,6 +106,46 @@ pub struct MailApp {
     sidebar_focus: FocusHandle,
     list_focus: FocusHandle,
     selected_index: Option<usize>,
+}
+
+struct SettingsSession {
+    draft: Prefs,
+    hex_input: Entity<ComposerInput>,
+    _hex_subscription: gpui::Subscription,
+    token: TokenId,
+    editing_dark: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkspacePane {
+    Sidebar,
+    List,
+    Reader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chrome {
+    Default,
+    Minimal,
+    Compact,
+}
+
+fn chrome_for(width_px: f32, rem: f32, workspace: WorkspaceMode) -> Chrome {
+    if width_px < rem.max(1.0) * COMPACT_WIDTH_REM {
+        Chrome::Compact
+    } else if workspace == WorkspaceMode::Minimal {
+        Chrome::Minimal
+    } else {
+        Chrome::Default
+    }
+}
+
+fn chrome(window: &Window, workspace: WorkspaceMode) -> Chrome {
+    chrome_for(
+        f32::from(window.viewport_size().width),
+        f32::from(window.rem_size()),
+        workspace,
+    )
 }
 
 struct Onboarding {
@@ -207,14 +269,13 @@ impl MailApp {
             None
         };
 
-        let selected_mailbox = accounts
-            .iter()
-            .flat_map(|account| account.mailboxes.iter())
-            .next()
-            .map(|mailbox| mailbox.id);
+        let selected_mailbox = first_sidebar_mailbox_id(&accounts);
 
         let mut app = Self {
             theme: Theme::from_env(),
+            prefs: prefs::cached(),
+            settings: None,
+            workspace_pane: WorkspacePane::List,
             store,
             accounts,
             selected_mailbox,
@@ -225,8 +286,15 @@ impl MailApp {
             message_load_error: None,
             message_scroll: UniformListScrollHandle::new(),
             body_scroll: ScrollHandle::new(),
+            attachment_scroll: ScrollHandle::new(),
+            attachment_pane_rem: ATTACHMENT_PANE_DEFAULT_REM,
+            split_drag_y: None,
             selected_message: None,
             selected_detail: None,
+            selected_body_cids: Arc::new(HashMap::new()),
+            selected_body_blocks: Arc::new(Vec::new()),
+            body_list: ListState::new(0, ListAlignment::Top, px(1000.)),
+            detail_generation: 0,
             detail_load_error: None,
             search_query: String::new(),
             search_results: Vec::new(),
@@ -254,6 +322,22 @@ impl MailApp {
             app.maybe_start_background_sync(cx);
             app.schedule_background_sync(cx);
         }
+
+        // 关窗进托盘：开启时吞掉 WM_CLOSE，把窗口藏起来；退出走托盘菜单 / 任务管理器。
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, app| {
+            let Some(entity) = this.upgrade() else {
+                return true;
+            };
+            let mut hide = false;
+            let _ = entity.update(app, |app, _| hide = app.prefs.close_to_tray);
+            if hide {
+                crate::tray::hide_window(window);
+                false
+            } else {
+                true
+            }
+        });
         app
     }
 
@@ -651,12 +735,7 @@ impl MailApp {
             Ok((store, accounts)) => {
                 self.store = Some(store);
                 self.accounts = accounts;
-                self.selected_mailbox = self
-                    .accounts
-                    .iter()
-                    .flat_map(|a| a.mailboxes.iter())
-                    .next()
-                    .map(|m| m.id);
+                self.selected_mailbox = first_sidebar_mailbox_id(&self.accounts);
                 self.load_error = None;
                 self.sync = None;
                 self.message_pages.clear();
@@ -735,16 +814,7 @@ impl MailApp {
                     .child("填写 IMAP 服务器与凭据，首次拉取会把邮件备份到本地并建立索引。"),
             )
             .child(onboarding_field(theme, "IMAP 服务器", &host_field, cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(onboarding_field(theme, "端口", &port_field, cx)),
-                    ),
-            )
+            .child(onboarding_field(theme, "端口", &port_field, cx))
             .child(onboarding_field(theme, "邮箱地址", &user_field, cx))
             .child(onboarding_field(
                 theme,
@@ -905,6 +975,8 @@ impl MailApp {
             .border_color(theme.border)
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_xs()
                     .text_color(if is_failed { theme.danger } else { theme.info })
                     .child(title),
@@ -959,11 +1031,11 @@ impl MailApp {
             // Errors are stringified so the task stays Send (Box<dyn Error> is not Send).
             let index_path = self.paths.index.clone();
             async move {
-                let store =
-                    MailStore::open_read_only(&index_path).map_err(|error| error.to_string())?;
-                store
-                    .save_attachment(message_id, attachment_index, &target)
-                    .map_err(|error| error.to_string())
+                let bytes = load_attachment_bytes(&index_path, message_id, attachment_index)?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                std::fs::write(&target, bytes).map_err(|error| error.to_string())
             }
         });
         cx.spawn(async move |this, cx| {
@@ -1046,11 +1118,7 @@ impl MailApp {
 
         let index_path = self.paths.index.clone();
         let task = cx.background_executor().spawn(async move {
-            let store =
-                MailStore::open_read_only(&index_path).map_err(|error| error.to_string())?;
-            let bytes = store
-                .read_attachment(message_id, attachment_index)
-                .map_err(|error| error.to_string())?;
+            let bytes = load_attachment_bytes(&index_path, message_id, attachment_index)?;
             if bytes.len() > MAX_IMAGE_PREVIEW_BYTES {
                 return Err(format!(
                     "附件过大（{}），超过 20 MiB 预览上限",
@@ -1116,6 +1184,15 @@ impl MailApp {
         self.open_search(window, cx);
     }
 
+    fn open_settings_action(
+        &mut self,
+        _: &OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(window, cx);
+    }
+
     fn close_preview_action(
         &mut self,
         _: &ClosePreview,
@@ -1131,7 +1208,9 @@ impl MailApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.preview.is_some() {
+        if self.settings.is_some() {
+            self.close_settings(cx);
+        } else if self.preview.is_some() {
             self.close_preview(window, cx);
         } else {
             self.dismiss_search(cx);
@@ -1169,8 +1248,13 @@ impl MailApp {
         }
     }
 
-    fn toggle_sidebar_action(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_sidebar(cx);
+    fn toggle_sidebar_action(
+        &mut self,
+        _: &ToggleSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_sidebar(window, cx);
     }
 
     fn sync_now(&mut self, _: &SyncNow, _: &mut Window, cx: &mut Context<Self>) {
@@ -1206,7 +1290,11 @@ impl MailApp {
             if self.accounts.len() > 1 && self.collapsed_accounts.contains(&account_key) {
                 continue;
             }
-            ids.extend(account.mailboxes.iter().map(|mailbox| mailbox.id));
+            ids.extend(
+                sidebar_mailboxes(&account.mailboxes)
+                    .into_iter()
+                    .map(|mailbox| mailbox.id),
+            );
         }
         ids
     }
@@ -1342,9 +1430,16 @@ impl MailApp {
         cx.notify();
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.dismiss_search(cx);
-        self.sidebar_collapsed = !self.sidebar_collapsed;
+        if chrome(window, self.prefs.workspace) == Chrome::Compact {
+            self.workspace_pane = match self.workspace_pane {
+                WorkspacePane::Sidebar => WorkspacePane::List,
+                _ => WorkspacePane::Sidebar,
+            };
+        } else {
+            self.sidebar_collapsed = !self.sidebar_collapsed;
+        }
         cx.notify();
     }
 
@@ -1367,6 +1462,8 @@ impl MailApp {
         self.search_open = false;
         let mailbox_changed = self.selected_mailbox != Some(id);
         if !mailbox_changed && !clear_search {
+            self.workspace_pane = WorkspacePane::List;
+            cx.notify();
             return;
         }
 
@@ -1380,6 +1477,7 @@ impl MailApp {
             self.detail_load_error = None;
             self.save_state = None;
             self.preview = None;
+            self.workspace_pane = WorkspacePane::List;
             self.body_scroll.set_offset(Default::default());
             if self.selected_count() > 0 {
                 self.message_scroll
@@ -1567,38 +1665,76 @@ impl MailApp {
     fn select_message(&mut self, id: i64, cx: &mut Context<Self>) {
         self.search_open = false;
         if self.selected_message == Some(id) && self.selected_detail.is_some() {
+            self.workspace_pane = WorkspacePane::Reader;
+            cx.notify();
             return;
         }
 
         self.selected_message = Some(id);
+        self.workspace_pane = WorkspacePane::Reader;
         self.selected_detail = None;
+        self.selected_body_cids = Arc::default();
+        self.selected_body_blocks = Arc::default();
         self.detail_load_error = None;
         self.save_state = None;
         self.preview = None;
         self.body_scroll.set_offset(Default::default());
-        match self.store.as_ref().map(|store| store.message_detail(id)) {
-            Some(Ok(Some(detail))) => {
-                self.selected_detail = Some(detail);
-            }
-            Some(Ok(None)) => {
-                self.selected_message = None;
-                self.detail_load_error = Some("邮件已不存在，请重新生成索引".into());
-            }
-            Some(Err(error)) => {
-                let problem = classify_index_error(error.as_ref());
-                self.detail_load_error = Some(index_problem_message(
-                    &self.paths,
-                    "message_detail_failed",
-                    problem,
-                    Some(error.as_ref()),
-                    "读取邮件详情",
-                ));
-            }
-            None => {
-                self.selected_message = None;
-                self.detail_load_error = Some("邮件索引未打开".into());
-            }
+        if self.store.is_none() {
+            self.selected_message = None;
+            self.detail_load_error = Some("邮件索引未打开".into());
+            cx.notify();
+            return;
         }
+
+        self.detail_generation = self.detail_generation.wrapping_add(1);
+        let generation = self.detail_generation;
+        let index_path = self.paths.index.clone();
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    load_detail_with_cids(&index_path, id).map_err(|error| {
+                        let problem = classify_index_error(error.as_ref());
+                        index_problem_message(
+                            &paths,
+                            "message_detail_failed",
+                            problem,
+                            Some(error.as_ref()),
+                            "读取邮件详情",
+                        )
+                    })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.detail_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(Some((detail, cids, blocks))) => {
+                        this.selected_body_cids = Arc::new(cids);
+                        this.selected_body_blocks = Arc::new(blocks);
+                        this.body_list = ListState::new(
+                            this.selected_body_blocks.len(),
+                            ListAlignment::Top,
+                            px(1000.),
+                        );
+                        this.selected_detail = Some(detail);
+                    }
+                    Ok(None) => {
+                        this.selected_message = None;
+                        this.detail_load_error = Some("邮件已不存在，请重新生成索引".into());
+                    }
+                    Err(error) => {
+                        this.selected_message = None;
+                        this.detail_load_error = Some(error);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1621,10 +1757,11 @@ impl MailApp {
             .map_or(0, |mailbox| mailbox.message_count)
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, cx: &mut Context<Self>, chrome: Chrome) -> impl IntoElement {
         let theme = self.theme;
-        let collapsed = self.sidebar_collapsed;
+        let collapsed = self.sidebar_collapsed && chrome != Chrome::Compact;
         let width = if collapsed { 3.25 } else { 14. };
+        let fill_width = chrome == Chrome::Compact;
         let account_name = self
             .accounts
             .first()
@@ -1649,7 +1786,7 @@ impl MailApp {
             let account_key = format!("{}\0{}", account.account, account.server);
             let account_folded = self.collapsed_accounts.contains(&account_key);
             let toggle_key = account_key.clone();
-            if multi_account {
+            if multi_account && !collapsed {
                 tree = tree.child(
                     div()
                         .id(("account", account_index))
@@ -1661,6 +1798,7 @@ impl MailApp {
                         .items_center()
                         .rounded(rems(0.5))
                         .hover(|style| style.bg(theme.raised))
+                        .tooltip(tooltip(account.account.clone(), theme))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             window.focus(&this.sidebar_focus, cx);
                             this.toggle_account(toggle_key.clone(), cx);
@@ -1682,6 +1820,7 @@ impl MailApp {
                                 .min_w_0()
                                 .flex_1()
                                 .overflow_hidden()
+                                .truncate()
                                 .text_color(theme.text_secondary)
                                 .text_sm()
                                 .child(SharedString::from(account.account.clone())),
@@ -1693,22 +1832,31 @@ impl MailApp {
                 continue;
             }
 
-            for mailbox in account.mailboxes {
+            for mailbox in sidebar_mailboxes(&account.mailboxes) {
                 let mailbox_id = mailbox.id;
                 let active = Some(mailbox_id) == self.selected_mailbox;
                 let label = mailbox_label(&mailbox.source_name, &mailbox.display_name);
-                let glyph = mailbox_glyph(&mailbox.source_name, &label);
+                let glyph = mailbox_glyph(&mailbox.source_name, &mailbox.display_name);
+                let glyph_color = mailbox_glyph_color(
+                    theme,
+                    &mailbox.source_name,
+                    &mailbox.display_name,
+                    self.prefs.sidebar_mono_icons,
+                    active,
+                );
+                let tip = format!("{label} · {}", mailbox.message_count);
                 tree = tree.child(
                     div()
                         .id(("mailbox", u64::try_from(mailbox_id).unwrap_or_default()))
-                        .mx_2()
+                        .when(collapsed, |row| row.mx_1().justify_center())
+                        .when(!collapsed, |row| row.mx_2().px_2())
                         .h(rems(2.))
-                        .px_2()
                         .flex()
                         .items_center()
                         .rounded(rems(0.5))
                         .when(active, |style| style.bg(theme.active))
                         .hover(|style| style.bg(theme.raised))
+                        .tooltip(tooltip(tip, theme))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             window.focus(&this.sidebar_focus, cx);
                             this.select_mailbox(mailbox_id, true, cx);
@@ -1720,36 +1868,35 @@ impl MailApp {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_color(if active {
-                                    theme.text
-                                } else {
-                                    theme.text_secondary
-                                })
+                                .text_color(glyph_color)
                                 .text_xs()
                                 .child(SharedString::from(glyph)),
                         )
-                        .child(
-                            div()
-                                .ml_1()
-                                .min_w_0()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_color(if active {
-                                    theme.text
-                                } else {
-                                    theme.text_secondary
-                                })
-                                .text_sm()
-                                .child(SharedString::from(label)),
-                        )
-                        .child(
-                            div()
-                                .ml_1()
-                                .flex_shrink_0()
-                                .text_color(theme.text_tertiary)
-                                .text_xs()
-                                .child(SharedString::from(mailbox.message_count.to_string())),
-                        ),
+                        .when(!collapsed, |row| {
+                            row.child(
+                                div()
+                                    .ml_1()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .truncate()
+                                    .text_color(if active {
+                                        theme.text
+                                    } else {
+                                        theme.text_secondary
+                                    })
+                                    .text_sm()
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(
+                                div()
+                                    .ml_1()
+                                    .flex_shrink_0()
+                                    .text_color(theme.text_tertiary)
+                                    .text_xs()
+                                    .child(SharedString::from(mailbox.message_count.to_string())),
+                            )
+                        }),
                 );
             }
         }
@@ -1781,15 +1928,14 @@ impl MailApp {
 
         div()
             .h_full()
-            .w(rems(width))
-            .flex_shrink_0()
-            .overflow_hidden()
+            .when(fill_width, |el| el.flex_1().w_full().min_w_0())
+            .when(!fill_width, |el| el.w(rems(width)).flex_shrink_0())
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
             .child(
                 div()
-                    .w(rems(14.))
+                    .w_full()
                     .h_full()
                     .flex()
                     .flex_col()
@@ -1830,6 +1976,7 @@ impl MailApp {
                                                 .min_w_0()
                                                 .flex_1()
                                                 .overflow_hidden()
+                                                .truncate()
                                                 .text_color(theme.text_secondary)
                                                 .text_sm()
                                                 .child(SharedString::from(account_name)),
@@ -1845,7 +1992,9 @@ impl MailApp {
                                     .size(rems(2.))
                                     .text_color(theme.text_tertiary)
                                     .tooltip(tooltip(
-                                        if collapsed {
+                                        if chrome == Chrome::Compact {
+                                            "返回列表"
+                                        } else if collapsed {
                                             "展开侧栏"
                                         } else {
                                             "折叠侧栏"
@@ -1853,17 +2002,16 @@ impl MailApp {
                                         theme,
                                     ))
                                     .child(if collapsed { "›" } else { "‹" })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_sidebar(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_sidebar(window, cx);
                                     })),
                             ),
                     )
                     .child(
                         control_button("compose-button", theme, ButtonKind::Ghost, false)
-                            .mx_2()
+                            .when(collapsed, |el| el.mx_1().justify_center())
+                            .when(!collapsed, |el| el.mx_2().px_2().justify_start())
                             .h(rems(2.))
-                            .px_2()
-                            .justify_start()
                             .tooltip(tooltip("写信", theme))
                             .on_click(cx.listener(|_this, _, _, cx| {
                                 crate::compose_window::ComposeWindow::open(
@@ -1882,16 +2030,19 @@ impl MailApp {
                                     .text_sm()
                                     .child("✎"),
                             )
-                            .child(
-                                div()
-                                    .ml_1()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .text_color(theme.text_secondary)
-                                    .text_sm()
-                                    .child("写信"),
-                            ),
+                            .when(!collapsed, |el| {
+                                el.child(
+                                    div()
+                                        .ml_1()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_color(theme.text_secondary)
+                                        .text_sm()
+                                        .child("写信"),
+                                )
+                            }),
                     )
                     .when(!collapsed, |col| {
                         col.child(
@@ -1909,6 +2060,40 @@ impl MailApp {
                         )
                     })
                     .child(tree)
+                    .child(
+                        control_button("sidebar-settings", theme, ButtonKind::Ghost, false)
+                            .when(collapsed, |el| el.mx_1().justify_center())
+                            .when(!collapsed, |el| el.mx_2().px_2().justify_start())
+                            .mb_1()
+                            .h(rems(2.))
+                            .tooltip(tooltip("设置", theme))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .size(rems(1.25))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(theme.text_secondary)
+                                    .text_sm()
+                                    .child("⚙"),
+                            )
+                            .when(!collapsed, |el| {
+                                el.child(
+                                    div()
+                                        .ml_1()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_color(theme.text_secondary)
+                                        .text_sm()
+                                        .child("设置"),
+                                )
+                            }),
+                    )
                     .when(!collapsed, |col| {
                         col.child(
                             control_button("sidebar-sync", theme, ButtonKind::Secondary, false)
@@ -1980,6 +2165,7 @@ impl MailApp {
                     let active = self.selected_message == Some(message_id);
                     let subject = nonempty_label(&message.subject, "（无主题）");
                     let sender = nonempty_label(&message.sender, "未知发件人");
+                    let monogram = account_monogram(&sender);
                     let date = compact_date(message.date_text.as_deref());
                     let metadata = if message.attachment_count == 0 {
                         date
@@ -2017,6 +2203,21 @@ impl MailApp {
                                 .items_center()
                                 .justify_between()
                                 .gap_3()
+                                .when(!self.prefs.hide_sender_avatar, |row| {
+                                    row.child(
+                                        div()
+                                            .size(rems(1.75))
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .bg(theme.raised)
+                                            .text_color(theme.text_secondary)
+                                            .text_xs()
+                                            .child(SharedString::from(monogram)),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .min_w_0()
@@ -2051,12 +2252,18 @@ impl MailApp {
             .collect()
     }
 
-    fn render_message_list(&mut self, cx: &mut Context<Self>, window: &Window) -> AnyElement {
+    fn render_message_list(
+        &mut self,
+        cx: &mut Context<Self>,
+        window: &Window,
+        chrome: Chrome,
+    ) -> AnyElement {
         let theme = self.theme;
         if !self.search_query.trim().is_empty() {
-            return self.render_search_results(cx, window);
+            return self.render_search_results(cx, window, chrome);
         }
         let message_count = self.selected_count();
+        let fill = chrome != Chrome::Default;
         let list = uniform_list(
             "message-list",
             message_count,
@@ -2068,9 +2275,10 @@ impl MailApp {
 
         div()
             .h_full()
-            .w(relative(0.18))
-            .min_w(rems(13.75))
-            .flex_shrink_0()
+            .when(fill, |el| el.flex_1().w_full().min_w_0())
+            .when(!fill, |el| {
+                el.w(relative(0.18)).min_w(rems(13.75)).flex_shrink_0()
+            })
             .bg(theme.surface)
             .border_r_1()
             .border_color(theme.border)
@@ -2094,9 +2302,39 @@ impl MailApp {
                     .border_color(theme.border)
                     .child(
                         div()
-                            .text_color(theme.text)
-                            .text_sm()
-                            .child(self.selected_name()),
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(chrome == Chrome::Compact, |el| {
+                                el.child(
+                                    control_button(
+                                        "workspace-back-list",
+                                        theme,
+                                        ButtonKind::Ghost,
+                                        false,
+                                    )
+                                    .size(rems(1.75))
+                                    .tooltip(tooltip("返回文件夹", theme))
+                                    .child("‹")
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.workspace_pane = WorkspacePane::Sidebar;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .text_sm()
+                                    .child(self.selected_name()),
+                            ),
                     )
                     .child(
                         div()
@@ -2134,7 +2372,12 @@ impl MailApp {
             .into_any_element()
     }
 
-    fn render_search_results(&mut self, cx: &mut Context<Self>, window: &Window) -> AnyElement {
+    fn render_search_results(
+        &mut self,
+        cx: &mut Context<Self>,
+        window: &Window,
+        chrome: Chrome,
+    ) -> AnyElement {
         let theme = self.theme;
         let query = self.search_query.trim().to_owned();
         let mut rows = div()
@@ -2235,9 +2478,12 @@ impl MailApp {
         };
         div()
             .h_full()
-            .w(relative(0.18))
-            .min_w(rems(13.75))
-            .flex_shrink_0()
+            .when(chrome != Chrome::Default, |el| {
+                el.flex_1().w_full().min_w_0()
+            })
+            .when(chrome == Chrome::Default, |el| {
+                el.w(relative(0.18)).min_w(rems(13.75)).flex_shrink_0()
+            })
             .bg(theme.surface)
             .border_r_1()
             .border_color(theme.border)
@@ -2262,10 +2508,38 @@ impl MailApp {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
-                            .text_color(theme.text)
-                            .text_sm()
-                            .child(SharedString::from(format!("搜索：{}", query))),
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(chrome == Chrome::Compact, |el| {
+                                el.child(
+                                    control_button(
+                                        "workspace-back-search",
+                                        theme,
+                                        ButtonKind::Ghost,
+                                        false,
+                                    )
+                                    .size(rems(1.75))
+                                    .tooltip(tooltip("返回文件夹", theme))
+                                    .child("‹")
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.workspace_pane = WorkspacePane::Sidebar;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .text_sm()
+                                    .child(SharedString::from(format!("搜索：{}", query))),
+                            ),
                     )
                     .child(
                         div()
@@ -2278,107 +2552,84 @@ impl MailApp {
             .into_any_element()
     }
 
+    fn drag_split(
+        &mut self,
+        event: &DragMoveEvent<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let y = f32::from(event.event.position.y);
+        if let Some(previous_y) = self.split_drag_y {
+            let rem = f32::from(window.rem_size()).max(1.0);
+            self.attachment_pane_rem =
+                clamp_attachment_pane(self.attachment_pane_rem + (previous_y - y) / rem);
+            cx.notify();
+        }
+        self.split_drag_y = Some(y);
+    }
+
     fn render_search_bar(&self, cx: &mut Context<Self>, _window: &Window) -> impl IntoElement {
         let theme = self.theme;
         let search_input = self.search_input.clone();
         let focused = self.search_open;
         let items = self.search_dropdown_items();
         let query = self.search_query.trim();
-        let empty = query.chars().count() > 2 && items.is_empty() && !self.search_pending;
-        let pending = self.search_pending;
         let selected = self.selected_message;
         let search_selection = self.search_selection;
-        let show_dropdown = self.search_open;
+        let show_dropdown = self.search_open && query.is_empty() && !items.is_empty();
 
         let mut results = div()
             .id("search-dropdown")
             .p_1()
             .flex()
             .flex_col()
-            .flex_shrink_0();
-        if pending {
-            results = results.child(
+            .flex_shrink_0()
+            .max_h(rems(SEARCH_DROPDOWN_MAX_REM))
+            .overflow_y_scroll()
+            .child(
                 div()
-                    .h(rems(2.))
+                    .h(rems(1.5))
                     .px_2()
                     .flex()
                     .flex_shrink_0()
                     .items_center()
                     .text_color(theme.text_tertiary)
                     .text_xs()
-                    .child("搜索中…"),
+                    .child("最近邮件"),
             );
-        } else if empty {
+        for (index, (message_id, mailbox_id, label)) in items.into_iter().enumerate() {
+            let active = selected == Some(message_id) || search_selection == index;
             results = results.child(
                 div()
+                    .id(("search-hit", u64::try_from(message_id).unwrap_or_default()))
+                    .h(rems(2.))
                     .px_2()
-                    .py_6()
                     .flex()
                     .flex_shrink_0()
-                    .flex_col()
                     .items_center()
-                    .justify_center()
-                    .gap_1()
+                    .overflow_hidden()
+                    .rounded(rems(0.375))
+                    .when(active, |style| style.bg(theme.active))
+                    .hover(|style| style.bg(theme.active))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.search_selection = index;
+                        this.search_open = false;
+                        window.focus(&this.list_focus, cx);
+                        this.select_message_from_search(mailbox_id, message_id, cx);
+                        cx.stop_propagation();
+                    }))
                     .child(
                         div()
-                            .mb_1()
-                            .size(rems(2.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(rems(0.5))
-                            .bg(theme.surface)
-                            .text_color(theme.text_tertiary)
-                            .text_sm()
-                            .child("⌕"),
-                    )
-                    .child(
-                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .truncate()
+                            .text_ellipsis()
                             .text_color(theme.text)
                             .text_sm()
-                            .child("未找到匹配邮件"),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_tertiary)
-                            .text_xs()
-                            .child("换个关键词再试试"),
+                            .child(SharedString::from(label)),
                     ),
             );
-        } else {
-            for (index, (message_id, mailbox_id, label)) in items.into_iter().enumerate() {
-                let active = selected == Some(message_id) || search_selection == index;
-                results = results.child(
-                    div()
-                        .id(("search-hit", u64::try_from(message_id).unwrap_or_default()))
-                        .h(rems(2.))
-                        .px_2()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .overflow_hidden()
-                        .rounded(rems(0.375))
-                        .when(active, |style| style.bg(theme.active))
-                        .hover(|style| style.bg(theme.active))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.search_selection = index;
-                            this.search_open = false;
-                            window.focus(&this.list_focus, cx);
-                            this.select_message_from_search(mailbox_id, message_id, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_color(theme.text)
-                                .text_sm()
-                                .child(SharedString::from(label)),
-                        ),
-                );
-            }
         }
 
         div()
@@ -2414,16 +2665,25 @@ impl MailApp {
                     )
                     .child(
                         div()
-                            .size(rems(0.875))
+                            .size(rems(1.))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_color(theme.text_tertiary)
-                            .text_xs()
+                            .text_sm()
+                            .line_height(rems(1.))
                             .child("⌕"),
                     )
-                    .child(div().flex_1().min_w_0().h_full().child(search_input))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .child(search_input),
+                    )
                     .when(!self.search_query.is_empty(), |element| {
                         element.child(
                             control_button("clear-search", theme, ButtonKind::Ghost, false)
@@ -2445,12 +2705,18 @@ impl MailApp {
             .when(show_dropdown, |card| card.child(results))
     }
 
-    fn render_reader(&self, cx: &mut Context<Self>, window: &Window) -> impl IntoElement {
+    fn render_reader(
+        &self,
+        cx: &mut Context<Self>,
+        window: &Window,
+        chrome: Chrome,
+    ) -> impl IntoElement {
         let theme = self.theme;
         let mut reader = div()
             .h_full()
-            .min_w(rems(18.75))
+            .when(chrome == Chrome::Default, |el| el.min_w(rems(18.75)))
             .flex_1()
+            .min_w_0()
             .bg(theme.canvas)
             .flex()
             .flex_col();
@@ -2481,6 +2747,7 @@ impl MailApp {
         } else if let Some(detail) = &self.selected_detail {
             let subject = nonempty_label(&detail.subject, "（无主题）");
             let sender = nonempty_label(&detail.sender, "未知发件人");
+            let sender_monogram = account_monogram(&sender);
             let recipients = nonempty_label(&detail.recipients, "未记录收件人");
             let date = nonempty_label(&compact_date(detail.date_text.as_deref()), "未知时间");
             let attachments = if detail.attachment_count == 0 {
@@ -2490,8 +2757,48 @@ impl MailApp {
             };
 
             reader = reader
+                .when(chrome != Chrome::Default, |el| {
+                    el.child(
+                        div()
+                            .h(rems(2.5))
+                            .px_4()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                control_button(
+                                    "workspace-back-reader",
+                                    theme,
+                                    ButtonKind::Ghost,
+                                    false,
+                                )
+                                .size(rems(1.75))
+                                .tooltip(tooltip("返回列表", theme))
+                                .child("‹")
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.workspace_pane = WorkspacePane::List;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                div()
+                                    .ml_1()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme.text_secondary)
+                                    .text_sm()
+                                    .child("邮件"),
+                            ),
+                    )
+                })
                 .child(
                     div()
+                        .flex_shrink_0()
                         .px_6()
                         .py_5()
                         .border_b_1()
@@ -2552,23 +2859,94 @@ impl MailApp {
                                     })),
                                 ),
                         )
-                        .child(detail_row(theme, "发件人", sender))
+                        .child(
+                            div()
+                                .mt_3()
+                                .flex()
+                                .items_start()
+                                .gap_3()
+                                .when(!self.prefs.hide_sender_avatar, |row| {
+                                    row.child(
+                                        div()
+                                            .size(rems(2.))
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .bg(theme.raised)
+                                            .text_color(theme.text_secondary)
+                                            .text_xs()
+                                            .child(SharedString::from(sender_monogram)),
+                                    )
+                                })
+                                .child(detail_row(theme, "发件人", sender)),
+                        )
                         .child(detail_row(theme, "收件人", recipients))
                         .child(detail_row(theme, "时间", date))
-                        .child(detail_row(theme, "附件", attachments))
-                        .child(self.render_attachment_list(
-                            &detail.attachments,
-                            detail.attachment_count,
-                            detail.attachment_load_error.as_deref(),
-                            window,
-                            cx,
-                        )),
+                        .child(detail_row(theme, "附件", attachments)),
                 )
-                .child(render_plain_body(
+                .child(render_message_body(
                     theme,
-                    preferred_body(&detail.body, &detail.html_body),
+                    detail,
+                    &self.selected_body_cids,
+                    &self.selected_body_blocks,
+                    &self.body_list,
                     &self.body_scroll,
-                ));
+                ))
+                .when(detail.attachment_count > 0, |reader| {
+                    reader
+                        .child(
+                            div()
+                                .id("reader-split")
+                                .relative()
+                                .h(rems(0.75))
+                                .w_full()
+                                .flex_shrink_0()
+                                .occlude()
+                                .cursor(CursorStyle::ResizeRow)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, _| {
+                                        this.split_drag_y = None;
+                                    }),
+                                )
+                                .on_drag((), |_, _, _, cx| cx.new(|_| Empty))
+                                .on_drag_move(cx.listener(Self::drag_split))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .top(rems(0.3125))
+                                        .h(rems(0.125))
+                                        .bg(theme.border),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(rems(self.attachment_pane_rem))
+                                .flex_shrink_0()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .px_6()
+                                .py_2()
+                                .child(
+                                    div()
+                                        .id("attachment-pane")
+                                        .h_full()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.attachment_scroll)
+                                        .child(self.render_attachment_list(
+                                            &detail.attachments,
+                                            detail.attachment_count,
+                                            detail.attachment_load_error.as_deref(),
+                                            window,
+                                            cx,
+                                        )),
+                                ),
+                        )
+                });
         } else if let Some(error) = &self.detail_load_error {
             reader = reader.child(
                 div()
@@ -2580,6 +2958,17 @@ impl MailApp {
                     .text_color(theme.text_secondary)
                     .text_sm()
                     .child(error.clone()),
+            );
+        } else if self.selected_message.is_some() {
+            reader = reader.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.text_tertiary)
+                    .text_sm()
+                    .child("正在加载邮件…"),
             );
         } else {
             reader = reader.child(
@@ -2596,6 +2985,619 @@ impl MailApp {
 
         reader
     }
+
+    fn render_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let chrome = chrome(window, self.prefs.workspace);
+        let shell = div().flex_1().min_h_0().min_w_0().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.dismiss_search(cx)),
+        );
+        match chrome {
+            Chrome::Compact => {
+                let child = match self.workspace_pane {
+                    WorkspacePane::Sidebar => self.render_sidebar(cx, chrome).into_any_element(),
+                    WorkspacePane::List => self.render_message_list(cx, window, chrome),
+                    WorkspacePane::Reader => {
+                        self.render_reader(cx, window, chrome).into_any_element()
+                    }
+                };
+                shell.flex().child(child)
+            }
+            Chrome::Minimal => {
+                let sidebar = self.render_sidebar(cx, chrome);
+                let content = if self.workspace_pane == WorkspacePane::Reader {
+                    self.render_reader(cx, window, chrome).into_any_element()
+                } else {
+                    self.render_message_list(cx, window, chrome)
+                };
+                shell.flex().child(sidebar).child(content)
+            }
+            Chrome::Default => shell
+                .flex()
+                .child(self.render_sidebar(cx, chrome))
+                .child(self.render_message_list(cx, window, chrome))
+                .child(self.render_reader(cx, window, chrome)),
+        }
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        let draft = self.prefs.clone();
+        let editing_dark = draft.is_dark();
+        let color = settings_token_color(&draft, editing_dark, TokenId::Primary);
+        let hex_input = cx.new(|cx| {
+            ComposerInput::new(
+                window,
+                cx,
+                format_hex(color),
+                ComposerInputOptions::single_line("#RRGGBB"),
+            )
+        });
+        let _hex_subscription = cx.subscribe(
+            &hex_input,
+            |this: &mut MailApp, _input, event: &ComposerEvent, cx| {
+                if matches!(event, ComposerEvent::Edited) {
+                    this.on_settings_hex_edited(cx);
+                } else if matches!(event, ComposerEvent::Cancel) {
+                    this.close_settings(cx);
+                }
+            },
+        );
+        self.settings = Some(SettingsSession {
+            draft,
+            hex_input,
+            _hex_subscription,
+            token: TokenId::Primary,
+            editing_dark,
+        });
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings = None;
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.settings.as_ref() else {
+            return;
+        };
+        if !session.draft.can_save_custom() {
+            return;
+        }
+        let previous_workspace = self.prefs.workspace;
+        let draft = session.draft.clone();
+        if prefs::apply(draft.clone()).is_err() {
+            return;
+        }
+        self.prefs = draft;
+        self.theme = Theme::from_prefs(&self.prefs);
+        if self.prefs.workspace == WorkspaceMode::Minimal
+            && previous_workspace != WorkspaceMode::Minimal
+        {
+            self.workspace_pane = WorkspacePane::List;
+        }
+        self.settings = None;
+        cx.notify();
+    }
+
+    fn settings_draft(&mut self) -> Option<&mut Prefs> {
+        self.settings.as_mut().map(|session| &mut session.draft)
+    }
+
+    fn on_settings_hex_edited(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.settings.as_mut() else {
+            return;
+        };
+        let Some(color) = parse_hex(session.hex_input.read(cx).content()) else {
+            return;
+        };
+        let token = session.token;
+        let dark = session.editing_dark;
+        settings_set_token(&mut session.draft, dark, token, color);
+        cx.notify();
+    }
+
+    fn set_settings_token(&mut self, token: TokenId, cx: &mut Context<Self>) {
+        let Some(session) = self.settings.as_mut() else {
+            return;
+        };
+        session.token = token;
+        let color = settings_token_color(&session.draft, session.editing_dark, token);
+        let hex = format_hex(color);
+        session.hex_input.update(cx, |input, cx| {
+            if input.content() != hex {
+                input.set_content(hex, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn set_settings_hsv(&mut self, channel: usize, t: f32, cx: &mut Context<Self>) {
+        let Some(session) = self.settings.as_mut() else {
+            return;
+        };
+        let color = settings_token_color(&session.draft, session.editing_dark, session.token);
+        let (mut h, mut s, mut v) = rgb_to_hsv(color);
+        match channel {
+            0 => h = t * 360.0,
+            1 => s = t,
+            _ => v = t,
+        }
+        let next = hsv_to_rgb(h, s, v);
+        let token = session.token;
+        let dark = session.editing_dark;
+        settings_set_token(&mut session.draft, dark, token, next);
+        let hex = format_hex(next);
+        session.hex_input.update(cx, |input, cx| {
+            if input.content() != hex {
+                input.set_content(hex, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn render_settings_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session = self.settings.as_ref()?;
+        let theme = self.theme;
+        let draft = &session.draft;
+        let can_save = draft.can_save_custom();
+        let failures = if draft.palette == Palette::Custom {
+            let mut items = draft.custom_dark.contrast_failures();
+            items.extend(draft.custom_light.contrast_failures());
+            items
+        } else {
+            Vec::new()
+        };
+        let hex_input = session.hex_input.clone();
+        let token = session.token;
+        let editing_dark = session.editing_dark;
+        let tokens = if editing_dark {
+            draft.custom_dark
+        } else {
+            draft.custom_light
+        };
+        let current = tokens.get(token);
+        let (h, s, v) = rgb_to_hsv(current);
+
+        Some(
+            div()
+                .id("settings-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.overlay)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_settings(cx)),
+                )
+                .child(
+                    div()
+                        .id("settings-card")
+                        .w(rems(28.))
+                        .max_h(relative(0.9))
+                        .flex()
+                        .flex_col()
+                        .bg(theme.surface)
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded(rems(0.5))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .px_4()
+                                .h(rems(3.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(div().text_color(theme.text).text_sm().child("设置"))
+                                .child(
+                                    control_button(
+                                        "settings-close",
+                                        theme,
+                                        ButtonKind::Ghost,
+                                        false,
+                                    )
+                                    .px(rems(0.5))
+                                    .child("关闭")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_settings(cx)),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("settings-body")
+                                .flex_1()
+                                .min_h_0()
+                                .px_4()
+                                .py_3()
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(settings_label(theme, "配色方案"))
+                                .child(self.render_scheme_row(cx, draft.scheme, theme))
+                                .child(settings_label(theme, "调色板"))
+                                .child(self.render_palette_row(cx, draft.palette, theme))
+                                .when(draft.palette == Palette::Custom, |col| {
+                                    col.child(self.render_custom_editor(
+                                        cx,
+                                        theme,
+                                        tokens,
+                                        token,
+                                        editing_dark,
+                                        hex_input,
+                                        h,
+                                        s,
+                                        v,
+                                    ))
+                                })
+                                .when(!failures.is_empty(), |col| {
+                                    let mut block = div().flex().flex_col().gap_1();
+                                    for (label, ratio) in failures {
+                                        block = block.child(
+                                            div().text_color(theme.danger).text_xs().child(
+                                                format!("{label} 对比度 {ratio:.2}，需要 ≥ 4.5"),
+                                            ),
+                                        );
+                                    }
+                                    col.child(block)
+                                })
+                                .child(self.render_toggle_row(
+                                    cx,
+                                    "sidebar-mono",
+                                    "侧栏单色图标",
+                                    draft.sidebar_mono_icons,
+                                    theme,
+                                ))
+                                .child(self.render_toggle_row(
+                                    cx,
+                                    "hide-avatar",
+                                    "隐藏发件人头像",
+                                    draft.hide_sender_avatar,
+                                    theme,
+                                ))
+                                .child(self.render_toggle_row(
+                                    cx,
+                                    "close-tray",
+                                    "关窗口进托盘",
+                                    draft.close_to_tray,
+                                    theme,
+                                ))
+                                .child(settings_label(theme, "工作区"))
+                                .child(self.render_workspace_row(cx, draft.workspace, theme)),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .h(rems(3.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .child(
+                                    control_button(
+                                        "settings-save",
+                                        theme,
+                                        ButtonKind::Primary,
+                                        !can_save,
+                                    )
+                                    .h(rems(2.))
+                                    .px_3()
+                                    .text_sm()
+                                    .child("保存")
+                                    .when(can_save, |el| {
+                                        el.on_click(cx.listener(|this, _, _, cx| {
+                                            this.save_settings(cx);
+                                        }))
+                                    }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_scheme_row(
+        &self,
+        cx: &mut Context<Self>,
+        current: ColorScheme,
+        theme: Theme,
+    ) -> impl IntoElement {
+        settings_segments(
+            theme,
+            &[
+                ("scheme-system", "系统", current == ColorScheme::System),
+                ("scheme-dark", "深色", current == ColorScheme::Dark),
+                ("scheme-light", "浅色", current == ColorScheme::Light),
+            ],
+            cx,
+            |this, index, cx| {
+                if let Some(draft) = this.settings_draft() {
+                    draft.scheme =
+                        [ColorScheme::System, ColorScheme::Dark, ColorScheme::Light][index];
+                }
+                cx.notify();
+            },
+        )
+    }
+
+    fn render_palette_row(
+        &self,
+        cx: &mut Context<Self>,
+        current: Palette,
+        theme: Theme,
+    ) -> impl IntoElement {
+        settings_segments(
+            theme,
+            &[
+                ("pal-default", "默认", current == Palette::Default),
+                ("pal-teal", "青绿", current == Palette::Teal),
+                ("pal-green", "绿色", current == Palette::Green),
+                ("pal-purple", "紫色", current == Palette::Purple),
+                ("pal-custom", "自定义", current == Palette::Custom),
+            ],
+            cx,
+            |this, index, cx| {
+                if let Some(draft) = this.settings_draft() {
+                    draft.palette = [
+                        Palette::Default,
+                        Palette::Teal,
+                        Palette::Green,
+                        Palette::Purple,
+                        Palette::Custom,
+                    ][index];
+                }
+                cx.notify();
+            },
+        )
+    }
+
+    fn render_workspace_row(
+        &self,
+        cx: &mut Context<Self>,
+        current: WorkspaceMode,
+        theme: Theme,
+    ) -> impl IntoElement {
+        settings_segments(
+            theme,
+            &[
+                ("ws-default", "默认", current == WorkspaceMode::Default),
+                ("ws-minimal", "极简", current == WorkspaceMode::Minimal),
+            ],
+            cx,
+            |this, index, cx| {
+                if let Some(draft) = this.settings_draft() {
+                    draft.workspace = [WorkspaceMode::Default, WorkspaceMode::Minimal][index];
+                }
+                cx.notify();
+            },
+        )
+    }
+
+    fn render_toggle_row(
+        &self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        label: &'static str,
+        on: bool,
+        theme: Theme,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(rems(2.))
+            .child(div().text_color(theme.text).text_sm().child(label))
+            .child(
+                div()
+                    .id(id)
+                    .w(rems(2.))
+                    .h(rems(1.125))
+                    .px(rems(0.125))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .bg(if on { theme.accent } else { theme.raised })
+                    .when(on, |el| el.justify_end())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.settings_draft() {
+                            if id == "sidebar-mono" {
+                                draft.sidebar_mono_icons = !draft.sidebar_mono_icons;
+                            } else if id == "close-tray" {
+                                draft.close_to_tray = !draft.close_to_tray;
+                            } else {
+                                draft.hide_sender_avatar = !draft.hide_sender_avatar;
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .child(div().size(rems(0.875)).rounded_full().bg(if on {
+                        theme.on_accent
+                    } else {
+                        theme.text_tertiary
+                    })),
+            )
+    }
+
+    fn render_custom_editor(
+        &self,
+        cx: &mut Context<Self>,
+        theme: Theme,
+        tokens: TokenSet,
+        token: TokenId,
+        editing_dark: bool,
+        hex_input: Entity<ComposerInput>,
+        h: f32,
+        s: f32,
+        v: f32,
+    ) -> impl IntoElement {
+        let mut tokens_row = div().flex().flex_col().gap_1();
+        for (index, id) in TokenId::ALL.into_iter().enumerate() {
+            let color = tokens.get(id);
+            let active = id == token;
+            tokens_row = tokens_row.child(
+                div()
+                    .id(("token", index as u64))
+                    .h(rems(2.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(rems(0.25))
+                    .when(active, |el| el.bg(theme.active))
+                    .hover(|el| el.bg(theme.raised))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_settings_token(id, cx)))
+                    .child(
+                        div()
+                            .size(rems(1.))
+                            .rounded(rems(0.25))
+                            .bg(rgb(color))
+                            .border_1()
+                            .border_color(theme.border),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme.text)
+                            .text_xs()
+                            .child(id.label()),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.text_tertiary)
+                            .text_xs()
+                            .child(format_hex(color)),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.render_custom_mode_row(cx, theme, editing_dark))
+            .child(tokens_row)
+            .child(
+                div()
+                    .h(rems(2.25))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .bg(theme.raised)
+                    .rounded(rems(0.25))
+                    .child(hex_input),
+            )
+            .child(self.render_hsv_slider(cx, theme, 0, h / 360.0, h, s, v))
+            .child(self.render_hsv_slider(cx, theme, 1, s, h, s, v))
+            .child(self.render_hsv_slider(cx, theme, 2, v, h, s, v))
+    }
+
+    fn render_custom_mode_row(
+        &self,
+        cx: &mut Context<Self>,
+        theme: Theme,
+        editing_dark: bool,
+    ) -> impl IntoElement {
+        settings_segments(
+            theme,
+            &[
+                ("custom-light", "浅色", !editing_dark),
+                ("custom-dark", "深色", editing_dark),
+            ],
+            cx,
+            |this, index, cx| {
+                if let Some(session) = this.settings.as_mut() {
+                    session.editing_dark = index == 1;
+                    let color =
+                        settings_token_color(&session.draft, session.editing_dark, session.token);
+                    let hex = format_hex(color);
+                    session.hex_input.update(cx, |input, cx| {
+                        if input.content() != hex {
+                            input.set_content(hex, cx);
+                        }
+                    });
+                }
+                cx.notify();
+            },
+        )
+    }
+
+    fn render_hsv_slider(
+        &self,
+        cx: &mut Context<Self>,
+        theme: Theme,
+        channel: usize,
+        value: f32,
+        h: f32,
+        s: f32,
+        v: f32,
+    ) -> impl IntoElement {
+        let label = ["H", "S", "V"][channel];
+        let mut bar = div()
+            .id(("hsv", channel as u64))
+            .h(rems(0.75))
+            .w_full()
+            .flex()
+            .rounded_full()
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.border)
+            .on_drag((), |_, _, _, cx| cx.new(|_| Empty))
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<()>, _, cx| {
+                let x = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+                let w = f32::from(event.bounds.size.width).max(1.0);
+                this.set_settings_hsv(channel, (x / w).clamp(0.0, 1.0), cx);
+            }));
+        for i in 0..24 {
+            let t = i as f32 / 23.0;
+            let color = match channel {
+                0 => hsv_to_rgb(t * 360.0, 1.0, 1.0),
+                1 => hsv_to_rgb(h, t, v.max(0.15)),
+                _ => hsv_to_rgb(h, s, t),
+            };
+            bar = bar.child(div().flex_1().h_full().bg(rgb(color)));
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(rems(1.))
+                    .flex_shrink_0()
+                    .text_color(theme.text_tertiary)
+                    .text_xs()
+                    .child(label),
+            )
+            .child(
+                div().flex_1().relative().child(bar).child(
+                    div()
+                        .absolute()
+                        .top(rems(-0.125))
+                        .left(relative(value.clamp(0.0, 1.0)))
+                        .ml(rems(-0.125))
+                        .size(rems(1.))
+                        .rounded_full()
+                        .bg(theme.text)
+                        .border_1()
+                        .border_color(theme.surface),
+                ),
+            )
+    }
 }
 
 impl Render for MailApp {
@@ -2611,6 +3613,7 @@ impl Render for MailApp {
                 .child(self.render_onboarding_or_sync(window, cx));
         }
         let overlay = self.render_preview_overlay(cx);
+        let settings = self.render_settings_overlay(cx);
         let banner = self.sync.clone();
         let theme = self.theme;
         div()
@@ -2629,23 +3632,13 @@ impl Render for MailApp {
             .on_action(cx.listener(Self::dismiss_overlay_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::sync_now))
+            .on_action(cx.listener(Self::open_settings_action))
             .when_some(banner, |this, sync| {
                 this.child(self.render_sync_banner(theme, sync))
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.dismiss_search(cx)),
-                    )
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_message_list(cx, window))
-                    .child(self.render_reader(cx, window)),
-            )
+            .child(self.render_workspace(window, cx))
             .when_some(overlay, |this, overlay| this.child(overlay))
+            .when_some(settings, |this, settings| this.child(settings))
     }
 }
 
@@ -2676,15 +3669,92 @@ fn onboarding_field(
         )
 }
 
-fn mailbox_label(source_name: &str, display_name: &str) -> String {
-    match source_name.to_ascii_uppercase().as_str() {
-        "INBOX" => "收件箱".to_owned(),
-        "SENT" | "SENT ITEMS" | "SENT MESSAGES" => "已发送".to_owned(),
-        "DRAFTS" => "草稿箱".to_owned(),
-        "TRASH" | "DELETED ITEMS" => "已删除".to_owned(),
-        "JUNK" | "SPAM" => "垃圾箱".to_owned(),
-        _ => display_name.to_owned(),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MailboxKind {
+    Inbox,
+    Drafts,
+    Sent,
+    Trash,
+    Junk,
+    Tagged,
+    Other,
+}
+
+fn name_eq(value: &str, candidates: &[&str]) -> bool {
+    let trimmed = value.trim();
+    let ascii = trimmed.to_ascii_uppercase();
+    candidates
+        .iter()
+        .any(|candidate| trimmed == *candidate || ascii == candidate.to_ascii_uppercase())
+}
+
+fn mailbox_kind(source_name: &str, display_name: &str) -> MailboxKind {
+    let names = [source_name, display_name];
+    if names.iter().any(|name| name_eq(name, &["INBOX", "收件箱"])) {
+        MailboxKind::Inbox
+    } else if names
+        .iter()
+        .any(|name| name_eq(name, &["DRAFTS", "DRAFT", "草稿箱", "草稿"]))
+    {
+        MailboxKind::Drafts
+    } else if names.iter().any(|name| {
+        name_eq(
+            name,
+            &["SENT", "SENT ITEMS", "SENT MESSAGES", "已发送", "发件箱"],
+        )
+    }) {
+        MailboxKind::Sent
+    } else if names.iter().any(|name| {
+        name_eq(
+            name,
+            &["TRASH", "DELETED ITEMS", "已删除", "已刪除", "废件箱"],
+        )
+    }) {
+        MailboxKind::Trash
+    } else if names
+        .iter()
+        .any(|name| name_eq(name, &["JUNK", "SPAM", "垃圾箱", "垃圾邮件", "垃圾郵件"]))
+    {
+        MailboxKind::Junk
+    } else if names
+        .iter()
+        .any(|name| name_eq(name, &["TAGGED", "LABELS", "标签邮件", "標籤郵件", "标签"]))
+    {
+        MailboxKind::Tagged
+    } else {
+        MailboxKind::Other
     }
+}
+
+fn mailbox_label(source_name: &str, display_name: &str) -> String {
+    match mailbox_kind(source_name, display_name) {
+        MailboxKind::Inbox => "收件箱".to_owned(),
+        MailboxKind::Drafts => "草稿箱".to_owned(),
+        MailboxKind::Sent => "已发送".to_owned(),
+        MailboxKind::Trash => "已删除".to_owned(),
+        MailboxKind::Junk => "垃圾邮件".to_owned(),
+        MailboxKind::Tagged => "标签邮件".to_owned(),
+        MailboxKind::Other => display_name.to_owned(),
+    }
+}
+
+fn sidebar_mailboxes(mailboxes: &[MailboxSummary]) -> Vec<&MailboxSummary> {
+    let mut items: Vec<&MailboxSummary> = mailboxes
+        .iter()
+        .filter(|mailbox| {
+            mailbox_kind(&mailbox.source_name, &mailbox.display_name) != MailboxKind::Other
+        })
+        .collect();
+    items.sort_by_key(|mailbox| mailbox_kind(&mailbox.source_name, &mailbox.display_name));
+    items
+}
+
+fn first_sidebar_mailbox_id(accounts: &[MailboxAccount]) -> Option<i64> {
+    accounts
+        .iter()
+        .flat_map(|account| sidebar_mailboxes(&account.mailboxes))
+        .next()
+        .map(|mailbox| mailbox.id)
 }
 
 fn account_monogram(account: &str) -> String {
@@ -2697,18 +3767,94 @@ fn account_monogram(account: &str) -> String {
         .unwrap_or_else(|| "M".to_owned())
 }
 
-fn mailbox_glyph(source_name: &str, label: &str) -> String {
-    match source_name.to_ascii_uppercase().as_str() {
-        "INBOX" => "收".to_owned(),
-        "SENT" | "SENT ITEMS" | "SENT MESSAGES" => "发".to_owned(),
-        "DRAFTS" => "草".to_owned(),
-        "TRASH" | "DELETED ITEMS" => "删".to_owned(),
-        "JUNK" | "SPAM" => "垃".to_owned(),
-        _ => label
-            .chars()
-            .next()
-            .map(|ch| ch.to_string())
-            .unwrap_or_else(|| "邮".to_owned()),
+fn mailbox_glyph(source_name: &str, display_name: &str) -> &'static str {
+    match mailbox_kind(source_name, display_name) {
+        MailboxKind::Inbox => "✉",
+        MailboxKind::Drafts => "▭",
+        MailboxKind::Sent => "↗",
+        MailboxKind::Trash => "⌫",
+        MailboxKind::Junk => "⚠",
+        MailboxKind::Tagged => "★",
+        MailboxKind::Other => "▤",
+    }
+}
+
+fn mailbox_glyph_color(
+    theme: Theme,
+    source_name: &str,
+    display_name: &str,
+    mono: bool,
+    active: bool,
+) -> gpui::Hsla {
+    if mono {
+        return if active {
+            theme.text
+        } else {
+            theme.text_secondary
+        };
+    }
+    match mailbox_kind(source_name, display_name) {
+        MailboxKind::Inbox => theme.info,
+        MailboxKind::Drafts => theme.warning,
+        MailboxKind::Sent => theme.success,
+        MailboxKind::Trash | MailboxKind::Junk => theme.danger,
+        MailboxKind::Tagged => theme.accent,
+        MailboxKind::Other if active => theme.text,
+        MailboxKind::Other => theme.text_secondary,
+    }
+}
+
+fn settings_label(theme: Theme, text: &'static str) -> impl IntoElement {
+    div()
+        .mt_1()
+        .text_color(theme.text_tertiary)
+        .text_xs()
+        .child(text)
+}
+
+fn settings_segments(
+    theme: Theme,
+    items: &[(&'static str, &'static str, bool)],
+    cx: &mut Context<MailApp>,
+    on_pick: impl Fn(&mut MailApp, usize, &mut Context<MailApp>) + 'static,
+) -> impl IntoElement {
+    let on_pick = std::rc::Rc::new(on_pick);
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .p_1()
+        .rounded(rems(0.375))
+        .bg(theme.raised);
+    for (index, (id, label, active)) in items.iter().copied().enumerate() {
+        let on_pick = on_pick.clone();
+        row = row.child(
+            control_button(id, theme, ButtonKind::Ghost, false)
+                .h(rems(1.75))
+                .px_2()
+                .text_xs()
+                .when(active, |el| el.bg(theme.active).text_color(theme.text))
+                .when(!active, |el| el.text_color(theme.text_secondary))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| on_pick(this, index, cx))),
+        );
+    }
+    row
+}
+
+fn settings_token_color(prefs: &Prefs, dark: bool, token: TokenId) -> u32 {
+    if dark {
+        prefs.custom_dark.get(token)
+    } else {
+        prefs.custom_light.get(token)
+    }
+}
+
+fn settings_set_token(prefs: &mut Prefs, dark: bool, token: TokenId, color: u32) {
+    if dark {
+        prefs.custom_dark.set(token, color);
+    } else {
+        prefs.custom_light.set(token, color);
     }
 }
 
@@ -2756,7 +3902,7 @@ fn detail_row(theme: Theme, label: &'static str, value: String) -> impl IntoElem
         .gap_3()
         .child(
             div()
-                .w(rems(3.))
+                .w(rems(3.5))
                 .flex_shrink_0()
                 .text_color(theme.text_tertiary)
                 .text_xs()
@@ -2848,32 +3994,219 @@ fn case_insensitive_match_ranges(value: &str, query: &str) -> Vec<(usize, usize)
     ranges
 }
 
-fn render_plain_body(theme: Theme, value: String, scroll: &ScrollHandle) -> impl IntoElement {
-    let body = normalize_plain_body(&value);
-    let empty = body.is_empty();
-    let text = if empty {
-        "正文为空".to_owned()
+fn render_message_body(
+    theme: Theme,
+    detail: &MessageDetail,
+    cids: &Arc<HashMap<String, Arc<Image>>>,
+    blocks: &Arc<Vec<BodyBlock>>,
+    body_list: &ListState,
+    scroll: &ScrollHandle,
+) -> impl IntoElement {
+    let html = detail.html_body.trim();
+    let body = div().flex_1().min_h_0().min_w_0().px_6().py_5();
+    if !html.is_empty() {
+        let cids = Arc::clone(cids);
+        let blocks = Arc::clone(blocks);
+        return body
+            .flex()
+            .flex_col()
+            .child(
+                list(body_list.clone(), move |ix, _, _| {
+                    div()
+                        .pb_2()
+                        .child(render_block(theme, blocks[ix].clone(), &cids))
+                        .into_any_element()
+                })
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element();
+    }
+    let text = normalize_plain_body(&detail.body);
+    let column = if text.is_empty() {
+        div()
+            .text_color(theme.text_tertiary)
+            .text_sm()
+            .child("正文为空")
     } else {
-        body
+        div()
+            .text_color(theme.text_secondary)
+            .text_sm()
+            .line_height(rems(1.375))
+            .child(SharedString::from(text))
     };
-
-    div()
-        .id("message-body")
-        .flex_1()
-        .min_h_0()
-        .min_w_0()
+    body.id("message-body")
         .overflow_y_scroll()
         .track_scroll(scroll)
-        .px_6()
-        .py_5()
-        .text_color(if empty {
-            theme.text_tertiary
-        } else {
-            theme.text_secondary
-        })
-        .text_sm()
-        .line_height(rems(1.375))
-        .child(SharedString::from(text))
+        .child(div().flex().flex_col().gap_2().child(column))
+        .into_any_element()
+}
+
+fn load_detail_with_cids(
+    index_path: &std::path::Path,
+    message_id: i64,
+) -> StoreResult<Option<(MessageDetail, HashMap<String, Arc<Image>>, Vec<BodyBlock>)>> {
+    let store = MailStore::open_read_only(index_path)?;
+    let Some((detail, cid_payloads)) = store.message_detail_with_assets(message_id)? else {
+        return Ok(None);
+    };
+    let mut cids = HashMap::new();
+    for meta in &detail.attachments {
+        let Some(cid) = meta.content_id.clone() else {
+            continue;
+        };
+        let Some(bytes) = cid_payloads.get(&cid) else {
+            continue;
+        };
+        if bytes.len() > MAX_IMAGE_PREVIEW_BYTES {
+            continue;
+        }
+        let Some(format) = resolve_image_format(&meta.content_type, &meta.filename, Some(bytes))
+        else {
+            continue;
+        };
+        cids.insert(
+            cid,
+            Arc::new(Image::from_bytes(gpui_image_format(format), bytes.clone())),
+        );
+    }
+    let blocks = if detail.html_body.trim().is_empty() {
+        Vec::new()
+    } else {
+        html::layout_html(&detail.html_body)
+    };
+    Ok(Some((detail, cids, blocks)))
+}
+
+fn render_block(theme: Theme, block: BodyBlock, cids: &HashMap<String, Arc<Image>>) -> AnyElement {
+    match block {
+        BodyBlock::Heading { level, spans } => div()
+            .text_color(theme.text)
+            .when(level <= 1, |el| el.text_lg())
+            .when(level == 2, |el| el.text_sm())
+            .child(render_spans(theme, spans, cids))
+            .into_any_element(),
+        BodyBlock::Quote { spans } => div()
+            .pl_3()
+            .border_l_2()
+            .border_color(theme.border)
+            .text_color(theme.text_secondary)
+            .text_sm()
+            .child(render_spans(theme, spans, cids))
+            .into_any_element(),
+        BodyBlock::Pre { text } => div()
+            .p_2()
+            .rounded(rems(0.25))
+            .bg(theme.raised)
+            .text_color(theme.text_secondary)
+            .text_xs()
+            .child(SharedString::from(text))
+            .into_any_element(),
+        BodyBlock::ListItem { ordered, spans } => div()
+            .flex()
+            .gap_2()
+            .text_color(theme.text_secondary)
+            .text_sm()
+            .child(if ordered { "•" } else { "•" })
+            .child(render_spans(theme, spans, cids))
+            .into_any_element(),
+        BodyBlock::Paragraph { spans } => div()
+            .text_color(theme.text_secondary)
+            .text_sm()
+            .line_height(rems(1.375))
+            .child(render_spans(theme, spans, cids))
+            .into_any_element(),
+        BodyBlock::Table { rows } => render_table(theme, rows, cids),
+    }
+}
+
+fn render_table(
+    theme: Theme,
+    rows: Vec<Vec<foxmail_imap::html::TableCell>>,
+    cids: &HashMap<String, Arc<Image>>,
+) -> AnyElement {
+    let mut table = div()
+        .w_full()
+        .min_w_0()
+        .border_1()
+        .border_color(theme.border)
+        .rounded(rems(0.25))
+        .flex()
+        .flex_col();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let mut line = div().w_full().flex().when(row_index > 0, |el| {
+            el.border_t_1().border_color(theme.border)
+        });
+        for cell in row {
+            line = line.child(
+                div()
+                    .flex_1()
+                    .min_w(rems(4.))
+                    .px_2()
+                    .py_1()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .when(cell.occupied, |el| el.py_0())
+                    .when(cell.header && !cell.occupied, |el| {
+                        el.bg(theme.raised).text_color(theme.text)
+                    })
+                    .when(!cell.header && !cell.occupied, |el| {
+                        el.text_color(theme.text_secondary)
+                    })
+                    .text_xs()
+                    .child(if cell.occupied {
+                        div().into_any_element()
+                    } else {
+                        render_spans(theme, cell.spans, cids).into_any_element()
+                    }),
+            );
+        }
+        table = table.child(line);
+    }
+    div()
+        .id("html-table")
+        .w_full()
+        .min_w_0()
+        .overflow_x_scroll()
+        .child(table)
+        .into_any_element()
+}
+
+fn render_spans(
+    theme: Theme,
+    spans: Vec<InlineSpan>,
+    cids: &HashMap<String, Arc<Image>>,
+) -> impl IntoElement {
+    let mut row = div().flex().flex_wrap().gap_1();
+    for span in spans {
+        row = match span {
+            InlineSpan::Text(text) => row.child(SharedString::from(text)),
+            InlineSpan::Break => row.child(div().w_full().h(rems(0.25))),
+            InlineSpan::Image { cid, alt } => {
+                if let Some(image) = cids.get(&cid) {
+                    row.child(
+                        img(image.clone())
+                            .object_fit(ObjectFit::Contain)
+                            .max_w(rems(20.))
+                            .max_h(rems(16.)),
+                    )
+                } else {
+                    row.child(div().text_color(theme.text_tertiary).text_xs().child(
+                        if alt.is_empty() {
+                            SharedString::from("[图片]")
+                        } else {
+                            SharedString::from(alt)
+                        },
+                    ))
+                }
+            }
+        };
+    }
+    row
+}
+
+fn clamp_attachment_pane(height: f32) -> f32 {
+    height.clamp(ATTACHMENT_PANE_MIN_REM, ATTACHMENT_PANE_MAX_REM)
 }
 
 fn preferred_body(plain_body: &str, html_body: &str) -> String {
@@ -2881,172 +4214,7 @@ fn preferred_body(plain_body: &str, html_body: &str) -> String {
         return normalize_plain_body(plain_body);
     }
 
-    sanitize_html_to_text(html_body)
-}
-
-fn sanitize_html_to_text(value: &str) -> String {
-    const BLOCK_TAGS: &[&str] = &[
-        "address",
-        "article",
-        "aside",
-        "blockquote",
-        "dd",
-        "div",
-        "dl",
-        "dt",
-        "figcaption",
-        "figure",
-        "footer",
-        "form",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "header",
-        "hr",
-        "li",
-        "main",
-        "nav",
-        "ol",
-        "p",
-        "pre",
-        "section",
-        "table",
-        "tbody",
-        "td",
-        "tfoot",
-        "th",
-        "thead",
-        "tr",
-        "ul",
-    ];
-    const VOID_TAGS: &[&str] = &["br", "hr"];
-    const BLOCKED_TAGS: &[&str] = &[
-        "applet", "embed", "iframe", "object", "script", "style", "svg", "template",
-    ];
-
-    let mut output = String::new();
-    let mut cursor = 0;
-    while cursor < value.len() {
-        let Some(relative_start) = value[cursor..].find('<') else {
-            append_decoded_text(&mut output, &value[cursor..]);
-            break;
-        };
-        let start = cursor + relative_start;
-        append_decoded_text(&mut output, &value[cursor..start]);
-
-        if value[start..].starts_with("<!--") {
-            let Some(relative_end) = value[start + 4..].find("-->") else {
-                break;
-            };
-            cursor = start + 4 + relative_end + 3;
-            continue;
-        }
-
-        let Some(end) = find_tag_end(value, start + 1) else {
-            append_decoded_text(&mut output, &value[start..]);
-            break;
-        };
-        let raw_tag = value[start + 1..end].trim();
-        let closing = raw_tag.starts_with('/');
-        let tag = raw_tag
-            .trim_start_matches('/')
-            .trim_start_matches('!')
-            .trim_start_matches('?')
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        let tag = tag
-            .trim_matches(|character: char| !character.is_ascii_alphanumeric())
-            .to_ascii_lowercase();
-
-        if BLOCKED_TAGS.contains(&tag.as_str()) {
-            if !closing {
-                let closing_marker = format!("</{tag}");
-                if let Some(relative_close) =
-                    value[end + 1..].to_ascii_lowercase().find(&closing_marker)
-                {
-                    cursor = end + 1 + relative_close;
-                    continue;
-                }
-                break;
-            }
-        } else if VOID_TAGS.contains(&tag.as_str()) || BLOCK_TAGS.contains(&tag.as_str()) {
-            push_newline(&mut output);
-        }
-
-        cursor = end + 1;
-    }
-
-    normalize_plain_body(&output)
-}
-
-fn find_tag_end(value: &str, mut cursor: usize) -> Option<usize> {
-    let mut quote = None;
-    while cursor < value.len() {
-        let character = value[cursor..].chars().next()?;
-        cursor += character.len_utf8();
-        match (quote, character) {
-            (Some(expected), current) if expected == current => quote = None,
-            (None, '\'') | (None, '"') => quote = Some(character),
-            (None, '>') => return Some(cursor - 1),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn append_decoded_text(output: &mut String, text: &str) {
-    let mut cursor = 0;
-    while cursor < text.len() {
-        let Some(relative_start) = text[cursor..].find('&') else {
-            output.push_str(&text[cursor..]);
-            break;
-        };
-        let start = cursor + relative_start;
-        output.push_str(&text[cursor..start]);
-        let Some(relative_end) = text[start..].find(';') else {
-            output.push('&');
-            cursor = start + 1;
-            continue;
-        };
-        let end = start + relative_end;
-        let entity = &text[start + 1..end];
-        if let Some(decoded) = decode_entity(entity) {
-            output.push(decoded);
-            cursor = end + 1;
-        } else {
-            output.push('&');
-            cursor = start + 1;
-        }
-    }
-}
-
-fn decode_entity(entity: &str) -> Option<char> {
-    match entity.to_ascii_lowercase().as_str() {
-        "amp" => Some('&'),
-        "apos" => Some('\''),
-        "gt" => Some('>'),
-        "lt" => Some('<'),
-        "nbsp" => Some(' '),
-        "quot" => Some('"'),
-        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-            u32::from_str_radix(&entity[2..], 16)
-                .ok()
-                .and_then(char::from_u32)
-        }
-        _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
-        _ => None,
-    }
-}
-
-fn push_newline(output: &mut String) {
-    if !output.is_empty() && !output.ends_with('\n') {
-        output.push('\n');
-    }
+    foxmail_imap::html::html_to_plain(html_body)
 }
 
 impl MailApp {
@@ -3063,18 +4231,6 @@ impl MailApp {
         if attachment_count == 0 {
             return section;
         }
-
-        section = section
-            .mt_4()
-            .pt_3()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_color(theme.text_secondary)
-                    .text_xs()
-                    .child(SharedString::from(format!("附件（{}）", attachment_count))),
-            );
 
         if attachments.is_empty() {
             return section.child(
@@ -3220,6 +4376,33 @@ impl MailApp {
     }
 }
 
+fn load_attachment_bytes(
+    index_path: &std::path::Path,
+    message_id: i64,
+    attachment_index: usize,
+) -> Result<Vec<u8>, String> {
+    let store = MailStore::open_read_only(index_path).map_err(|error| error.to_string())?;
+    match store
+        .attachment_payload(message_id, attachment_index)
+        .map_err(|error| error.to_string())?
+    {
+        AttachmentPayload::Bytes(bytes) => Ok(bytes),
+        AttachmentPayload::Deferred(deferred) => {
+            let account = account_config::load()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "未找到邮箱账号配置".to_owned())?;
+            backup::fetch_deferred_attachment(
+                &deferred,
+                &account.host,
+                account.port,
+                &account.user,
+                &account.password,
+            )
+            .map_err(|error| error.to_string())
+        }
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -3277,16 +4460,102 @@ fn compact_date(value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_insensitive_match_ranges, compact_date, format_bytes, mailbox_label,
-        next_search_selection, nonempty_label, normalize_plain_body, preferred_body,
-        sanitize_html_to_text, search_status,
+        case_insensitive_match_ranges, chrome_for, clamp_attachment_pane, compact_date,
+        format_bytes, mailbox_glyph, mailbox_kind, mailbox_label, next_search_selection,
+        nonempty_label, normalize_plain_body, preferred_body, search_status, sidebar_mailboxes,
+        Chrome, MailboxKind, MailboxSummary, WorkspaceMode, ATTACHMENT_PANE_DEFAULT_REM,
+        ATTACHMENT_PANE_MAX_REM, ATTACHMENT_PANE_MIN_REM, COMPACT_WIDTH_REM,
     };
+
+    #[test]
+    fn compact_chrome_wins_over_workspace_mode() {
+        let rem = 16.0;
+        let compact_px = rem * COMPACT_WIDTH_REM - 1.0;
+        let wide_px = rem * COMPACT_WIDTH_REM + 200.0;
+        assert_eq!(
+            chrome_for(compact_px, rem, WorkspaceMode::Default),
+            Chrome::Compact
+        );
+        assert_eq!(
+            chrome_for(compact_px, rem, WorkspaceMode::Minimal),
+            Chrome::Compact
+        );
+        assert_eq!(
+            chrome_for(wide_px, rem, WorkspaceMode::Default),
+            Chrome::Default
+        );
+        assert_eq!(
+            chrome_for(wide_px, rem, WorkspaceMode::Minimal),
+            Chrome::Minimal
+        );
+    }
 
     #[test]
     fn localizes_standard_mailbox_names_without_overwriting_custom_names() {
         assert_eq!(mailbox_label("INBOX", "INBOX"), "收件箱");
         assert_eq!(mailbox_label("Sent Items", "Sent Items"), "已发送");
         assert_eq!(mailbox_label("&XfJT0ZAB-", "已发送"), "已发送");
+        assert_eq!(mailbox_label("&V4NXPnux-", "垃圾箱"), "垃圾邮件");
+        assert_eq!(mailbox_label("标签邮件", "标签邮件"), "标签邮件");
+        assert_eq!(mailbox_label("工作", "工作"), "工作");
+    }
+
+    #[test]
+    fn sidebar_keeps_only_standard_roles_in_fixed_order() {
+        let mailboxes = [
+            ("INBOX", "INBOX"),
+            ("&V4NXPnux-", "垃圾箱"),
+            ("&XfJSIJZk-", "已删除"),
+            ("&XfJT0ZAB-", "已发送"),
+            ("&bYhgb3bSW1A-", "消息盒子"),
+            ("&f6SQrk72-", "群邮件"),
+            ("&g0l6P3ux-", "草稿箱"),
+            ("标签邮件", "标签邮件"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (source_name, display_name))| MailboxSummary {
+            id: index as i64 + 1,
+            source_name: source_name.to_owned(),
+            display_name: display_name.to_owned(),
+            message_count: 0,
+        })
+        .collect::<Vec<_>>();
+        let labels: Vec<String> = sidebar_mailboxes(&mailboxes)
+            .into_iter()
+            .map(|mailbox| mailbox_label(&mailbox.source_name, &mailbox.display_name))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "收件箱",
+                "草稿箱",
+                "已发送",
+                "已删除",
+                "垃圾邮件",
+                "标签邮件"
+            ]
+        );
+        assert_eq!(mailbox_kind("消息盒子", "消息盒子"), MailboxKind::Other);
+        assert_eq!(mailbox_kind("群邮件", "群邮件"), MailboxKind::Other);
+    }
+
+    #[test]
+    fn collapsed_glyphs_identify_role_not_first_character() {
+        let sent = mailbox_glyph("&XfJT0ZAB-", "已发送");
+        let trash = mailbox_glyph("已删除", "已删除");
+        let junk = mailbox_glyph("垃圾箱", "垃圾箱");
+        let inbox = mailbox_glyph("收件箱", "收件箱");
+        let other = mailbox_glyph("消息盒子", "消息盒子");
+        assert_ne!(sent, trash);
+        assert_ne!(sent, junk);
+        assert_ne!(trash, junk);
+        assert_ne!(inbox, other);
+        assert_eq!(sent, mailbox_glyph("SENT", "Sent"));
+        assert_eq!(other, mailbox_glyph("工作", "工作"));
+        assert_ne!(other.chars().next(), Some('工'));
+        assert_ne!(sent.chars().next(), Some('已'));
+        assert_ne!(trash.chars().next(), Some('已'));
     }
 
     #[test]
@@ -3346,28 +4615,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_safe_html_as_text_and_preserves_basic_structure() {
-        assert_eq!(
-            sanitize_html_to_text(
-                "<h1>标题</h1><p>第一行<br>第二行 &amp; &#x4E2D;</p><ul><li>项目</li></ul>"
-            ),
-            "标题\n第一行\n第二行 & 中\n项目"
-        );
-    }
-
-    #[test]
-    fn drops_active_html_content_attributes_and_resources() {
-        let rendered = sanitize_html_to_text(
-            "<p onclick=alert(1)>正文</p><script>alert(2)</script><style>body{color:red}</style>\
-             <iframe src='https://evil.test'>外部内容</iframe><img src='https://evil.test/x' alt='图片'>\
-             <a href='javascript:alert(3)'>安全链接文本</a>",
-        );
-        assert_eq!(rendered, "正文\n安全链接文本");
-        assert!(!rendered.contains("alert"));
-        assert!(!rendered.contains("evil.test"));
-    }
-
-    #[test]
     fn falls_back_to_plain_body_when_html_has_no_displayable_text() {
         assert_eq!(
             preferred_body("纯文本正文", "<p>HTML 正文</p>"),
@@ -3376,5 +4623,21 @@ mod tests {
         assert_eq!(preferred_body("", "<p>HTML 正文</p>"), "HTML 正文");
         assert_eq!(preferred_body("", "<script>secret()</script>"), "");
         assert_eq!(preferred_body("纯文本正文", ""), "纯文本正文");
+    }
+
+    #[test]
+    fn clamps_attachment_pane_height() {
+        assert_eq!(
+            clamp_attachment_pane(ATTACHMENT_PANE_DEFAULT_REM),
+            ATTACHMENT_PANE_DEFAULT_REM
+        );
+        assert_eq!(
+            clamp_attachment_pane(ATTACHMENT_PANE_MIN_REM - 8.0),
+            ATTACHMENT_PANE_MIN_REM
+        );
+        assert_eq!(
+            clamp_attachment_pane(ATTACHMENT_PANE_MAX_REM + 40.0),
+            ATTACHMENT_PANE_MAX_REM
+        );
     }
 }

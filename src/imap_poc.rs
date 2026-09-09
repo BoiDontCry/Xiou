@@ -1,7 +1,7 @@
+use foxmail_imap::backup;
 use foxmail_imap::credentials;
 use foxmail_imap::imap_config::{HOST, PORT, USER};
 use foxmail_imap::imap_errors::login_error;
-use imap::ClientBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reset_password = std::env::args().any(|arg| arg == "--reset-password");
@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[M0] IMAP PoC: 连接 {}:{}，启用严格 TLS 校验 ...",
         HOST, PORT
     );
-    let client = ClientBuilder::new(HOST, PORT).connect()?;
+    let client = backup::connect(HOST, PORT)?;
     println!("[M0] TLS 握手及证书校验成功");
 
     let mut session = client

@@ -1,7 +1,11 @@
+use crate::html;
 use crate::imap_utf7;
+use crate::search_query::{self, ParsedQuery};
+use crate::mime_plan::{AttachmentSidecar, DeferredAttachment};
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::Write;
@@ -77,6 +81,11 @@ END;
 "#;
 
 pub type StoreResult<T> = Result<T, Box<dyn Error>>;
+
+pub enum AttachmentPayload {
+    Bytes(Vec<u8>),
+    Deferred(DeferredAttachment),
+}
 
 /// 本地归档邮箱的 UIDVALIDITY 哨兵值。RFC 3501 规定真实 UIDVALIDITY 非零，故 0 可安全占用。
 /// 归档邮件已改为并入收件箱，此值现在只用于识别并清理早期版本留下的独立归档邮箱。
@@ -158,6 +167,23 @@ pub struct AttachmentMeta {
     pub content_type: String,
     pub size_bytes: usize,
     pub inline: bool,
+    pub content_id: Option<String>,
+}
+
+struct MessageRow {
+    id: i64,
+    mailbox_id: i64,
+    uid: u32,
+    subject: String,
+    sender: String,
+    recipients: String,
+    date_text: Option<String>,
+    date_unix: Option<i64>,
+    body: String,
+    html_body: String,
+    attachment_count: i64,
+    size_bytes: i64,
+    eml_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -296,18 +322,181 @@ impl MailStore {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> StoreResult<Vec<SearchHit>> {
-        let limit = i64::try_from(limit.min(1_000))?;
-        // ponytail: <3 字查询走 message 表 LIKE 全表扫描，大库会慢；
-        // 升级路径是 bigram 重建 FTS 索引。trigram 分词器对 <3 字查询切不出 trigram，只能兜底。
-        if query.chars().count() >= 3 {
-            self.search_fts(query, limit)
-        } else {
-            self.search_like(query, limit)
+        let parsed = search_query::parse(query);
+        if !has_positive_selector(&parsed) {
+            // 无任何匹配条件（含 <3 字纯词查询）→ LIKE 兜底。
+            let limit = i64::try_from(limit.min(1_000))?;
+            return self.search_like(query, limit);
         }
+        let limit = i64::try_from(limit.min(1_000))?;
+        let cap = (limit * 4).clamp(50, 400);
+
+        let mut ranked = self.search_ranked_ids(&parsed, cap)?;
+        // 全词 AND 无结果时放宽为 OR 重试（多术语查询才有意义）。
+        if ranked.is_empty() && !parsed.fts.is_empty() && parsed.fts_or != parsed.fts {
+            let relaxed = ParsedQuery {
+                fts: parsed.fts_or.clone(),
+                ..parsed.clone()
+            };
+            ranked = self.search_ranked_ids(&relaxed, cap)?;
+        }
+        self.hydrate_hits(ranked, &parsed, limit)
     }
 
-    fn search_fts(&self, query: &str, limit: i64) -> StoreResult<Vec<SearchHit>> {
-        let mut statement = self.connection.prepare(
+    /// 词法检索：bm25 加权（标题 4 > 发件人/收件人 2 > 正文 1）+
+    /// 操作符过滤，返回 (id, rank)，rank 越小越优。
+    fn search_ranked_ids(&self, q: &ParsedQuery, cap: i64) -> StoreResult<Vec<(i64, f64)>> {
+        let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+
+        // bm25() 只能在直接查询 FTS 表时求值，故在 MATERIALIZED CTE 内排序。
+        let (cte, fts_join, rank_expr) = if q.fts.is_empty() {
+            (String::new(), String::new(), "0.0".to_owned())
+        } else {
+            binds.push(Box::new(q.fts.clone()));
+            (
+                format!(
+                    "WITH f AS MATERIALIZED (
+                         SELECT rowid AS mid,
+                                bm25(message_fts, 4.0, 2.0, 2.0, 1.0) AS fts_rank
+                         FROM message_fts
+                         WHERE message_fts MATCH ?1
+                         ORDER BY fts_rank
+                         LIMIT {cap})"
+                ),
+                "JOIN f ON f.mid = m.id".to_owned(),
+                "f.fts_rank".to_owned(),
+            )
+        };
+
+        if let Some(from) = &q.from {
+            binds.push(Box::new(format!("%{}%", escape_like_pattern(from))));
+            clauses.push(format!(
+                "m.sender LIKE ?{n} ESCAPE char(92) COLLATE NOCASE",
+                n = binds.len()
+            ));
+        }
+        if let Some(to) = &q.to {
+            binds.push(Box::new(format!("%{}%", escape_like_pattern(to))));
+            clauses.push(format!(
+                "m.recipients LIKE ?{n} ESCAPE char(92) COLLATE NOCASE",
+                n = binds.len()
+            ));
+        }
+        if q.has_attachment {
+            clauses.push("m.attachment_count > 0".to_owned());
+        }
+        let role = mailbox_role_sql("mb");
+        if let Some(role_value) = &q.in_role {
+            binds.push(Box::new(role_value.clone()));
+            clauses.push(format!("{role} = ?{}", binds.len()));
+        } else {
+            // 有正向匹配条件时默认排除已删除/垃圾箱；in:trash 显式指定才纳入。
+            clauses.push(format!("{role} NOT IN ('trash','spam')"));
+        }
+        for term in &q.like_terms {
+            binds.push(Box::new(format!("%{}%", escape_like_pattern(term))));
+            let n = binds.len();
+            clauses.push(format!(
+                "(m.subject LIKE ?{n} ESCAPE char(92) COLLATE NOCASE
+                  OR m.body LIKE ?{n} ESCAPE char(92) COLLATE NOCASE
+                  OR m.sender LIKE ?{n} ESCAPE char(92) COLLATE NOCASE
+                  OR m.recipients LIKE ?{n} ESCAPE char(92) COLLATE NOCASE)"
+            ));
+        }
+        if !q.fts_not.is_empty() {
+            binds.push(Box::new(q.fts_not.clone()));
+            clauses.push(format!(
+                "m.id NOT IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?{})",
+                binds.len()
+            ));
+        }
+
+        if clauses.is_empty() && q.fts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", clauses.join(" AND "))
+        };
+
+        let sql = format!(
+            "{cte}
+             SELECT m.id, {rank_expr}
+             FROM message AS m
+             JOIN mailbox AS mb ON mb.id = m.mailbox_id
+             {fts_join}
+             WHERE 1=1{where_sql}
+             ORDER BY {rank_expr} ASC, m.date_unix DESC, m.uid DESC
+             LIMIT {cap}"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            binds.iter().map(|b| b.as_ref()).collect();
+        let rows = statement.query_map(params_ref.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let out = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// 按 (id, rank) 水合为 SearchHit：发件人匹配 + 新鲜度加分后排序，
+    /// 有 FTS 术语时附带正文 snippet。
+    fn hydrate_hits(
+        &self,
+        ranked: Vec<(i64, f64)>,
+        q: &ParsedQuery,
+        limit: i64,
+    ) -> StoreResult<Vec<SearchHit>> {
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut scored = ranked;
+        if !q.terms.is_empty() {
+            let id_list = id_in_list(scored.iter().map(|(id, _)| *id));
+            let sql = format!(
+                "SELECT id, sender, COALESCE(date_unix, 0)
+                 FROM message WHERE id IN ({id_list})"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let info: HashMap<i64, (String, i64)> = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .filter_map(Result::ok)
+                .map(|(id, sender, date_unix)| (id, (sender, date_unix)))
+                .collect();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for (id, rank) in scored.iter_mut() {
+                let Some((sender, date_unix)) = info.get(id) else {
+                    continue;
+                };
+                let age_days = now.saturating_sub((*date_unix).max(0) as u64) / 86400;
+                *rank -= 1.5 * f64::from(sender_match(&q.terms, sender))
+                    + 0.3 / (1.0 + f64::from(age_days as u32) / 30.0);
+            }
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        let top: Vec<i64> = scored
+            .iter()
+            .take(limit as usize)
+            .map(|(id, _)| *id)
+            .collect();
+        let order: HashMap<i64, usize> =
+            top.iter().enumerate().map(|(ix, id)| (*id, ix)).collect();
+
+        let id_list = id_in_list(top.iter().copied());
+        let sql = format!(
             "SELECT m.id,
                     m.mailbox_id,
                     mb.display_name,
@@ -316,30 +505,59 @@ impl MailStore {
                     m.sender,
                     m.recipients,
                     m.date_text,
-                    snippet(message_fts, 3, '[', ']', '…', 18),
                     m.eml_path
-             FROM message_fts
-             JOIN message AS m ON m.id = message_fts.rowid
+             FROM message AS m
              JOIN mailbox AS mb ON mb.id = m.mailbox_id
-             WHERE message_fts MATCH ?1
-             ORDER BY bm25(message_fts), m.date_unix DESC, m.uid DESC
-             LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![query, limit], |row| {
-            Ok(SearchHit {
-                id: row.get(0)?,
-                mailbox_id: row.get(1)?,
-                mailbox: row.get(2)?,
-                uid: row.get(3)?,
-                subject: row.get(4)?,
-                sender: row.get(5)?,
-                recipients: row.get(6)?,
-                date_text: row.get(7)?,
-                snippet: row.get(8)?,
-                eml_path: row.get(9)?,
-            })
+             WHERE m.id IN ({id_list})"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut hits: Vec<Option<SearchHit>> = vec![None; top.len()];
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchHit {
+                    id: row.get(0)?,
+                    mailbox_id: row.get(1)?,
+                    mailbox: row.get(2)?,
+                    uid: row.get(3)?,
+                    subject: row.get(4)?,
+                    sender: row.get(5)?,
+                    recipients: row.get(6)?,
+                    date_text: row.get(7)?,
+                    snippet: String::new(),
+                    eml_path: row.get(8)?,
+                },
+            ))
         })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        for row in rows {
+            let (id, hit) = row?;
+            if let Some(&ix) = order.get(&id) {
+                hits[ix] = Some(hit);
+            }
+        }
+
+        if !q.fts.is_empty() {
+            let match_ids = top.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT rowid, snippet(message_fts, 3, '[', ']', '…', 24)
+                 FROM message_fts
+                 WHERE message_fts MATCH ?1 AND rowid IN ({match_ids})"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let snippets: HashMap<i64, String> = statement
+                .query_map(params![q.fts], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            for hit in hits.iter_mut().flatten() {
+                if let Some(snippet) = snippets.get(&hit.id) {
+                    hit.snippet = snippet.clone();
+                }
+            }
+        }
+
+        Ok(hits.into_iter().flatten().collect())
     }
 
     fn search_like(&self, query: &str, limit: i64) -> StoreResult<Vec<SearchHit>> {
@@ -515,8 +733,48 @@ impl MailStore {
     }
 
     pub fn message_detail(&self, message_id: i64) -> StoreResult<Option<MessageDetail>> {
-        let row = self
-            .connection
+        let Some(row) = self.message_row(message_id)? else {
+            return Ok(None);
+        };
+
+        let attachment_path = self.resolve_source_path(&row.eml_path);
+        let (attachments, attachment_load_error) = match read_attachment_metadata(&attachment_path)
+        {
+            Ok(attachments) => (attachments, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+
+        Ok(Some(Self::detail_from_row(
+            row,
+            attachments,
+            attachment_load_error,
+        )))
+    }
+
+    /// 打开邮件详情专用的单次解析路径：只读取并解析一次 `.eml`，
+    /// 同时得到附件元数据与全部带 Content-ID 的内嵌资源载荷，
+    /// 避免按附件逐个重复读盘解析（大邮件下是 N 次全量解析）。
+    pub fn message_detail_with_assets(
+        &self,
+        message_id: i64,
+    ) -> StoreResult<Option<(MessageDetail, HashMap<String, Vec<u8>>)>> {
+        let Some(row) = self.message_row(message_id)? else {
+            return Ok(None);
+        };
+
+        let attachment_path = self.resolve_source_path(&row.eml_path);
+        let (attachments, cid_payloads, attachment_load_error) = match read_eml_assets(&attachment_path)
+        {
+            Ok((attachments, cid_payloads)) => (attachments, cid_payloads, None),
+            Err(error) => (Vec::new(), HashMap::new(), Some(error.to_string())),
+        };
+
+        let detail = Self::detail_from_row(row, attachments, attachment_load_error);
+        Ok(Some((detail, cid_payloads)))
+    }
+
+    fn message_row(&self, message_id: i64) -> StoreResult<Option<MessageRow>> {
+        self.connection
             .query_row(
                 "SELECT id,
                         mailbox_id,
@@ -535,68 +793,49 @@ impl MailStore {
                  WHERE id = ?1",
                 params![message_id],
                 |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, u32>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, i64>(10)?,
-                        row.get::<_, i64>(11)?,
-                        row.get::<_, String>(12)?,
-                    ))
+                    Ok(MessageRow {
+                        id: row.get(0)?,
+                        mailbox_id: row.get(1)?,
+                        uid: row.get(2)?,
+                        subject: row.get(3)?,
+                        sender: row.get(4)?,
+                        recipients: row.get(5)?,
+                        date_text: row.get(6)?,
+                        date_unix: row.get(7)?,
+                        body: row.get(8)?,
+                        html_body: row.get(9)?,
+                        attachment_count: row.get(10)?,
+                        size_bytes: row.get(11)?,
+                        eml_path: row.get(12)?,
+                    })
                 },
             )
-            .optional()?;
+            .optional()
+            .map_err(Into::into)
+    }
 
-        let Some((
-            id,
-            mailbox_id,
-            uid,
-            subject,
-            sender,
-            recipients,
-            date_text,
-            date_unix,
-            body,
-            html_body,
-            attachment_count,
-            size_bytes,
-            eml_path,
-        )) = row
-        else {
-            return Ok(None);
-        };
-
-        let attachment_path = self.resolve_source_path(&eml_path);
-        let (attachments, attachment_load_error) = match read_attachment_metadata(&attachment_path)
-        {
-            Ok(attachments) => (attachments, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
-        };
-
-        Ok(Some(MessageDetail {
-            id,
-            mailbox_id,
-            uid,
-            subject,
-            sender,
-            recipients,
-            date_text,
-            date_unix,
-            body,
-            html_body,
-            attachment_count: usize::try_from(attachment_count)?,
+    fn detail_from_row(
+        row: MessageRow,
+        attachments: Vec<AttachmentMeta>,
+        attachment_load_error: Option<String>,
+    ) -> MessageDetail {
+        MessageDetail {
+            id: row.id,
+            mailbox_id: row.mailbox_id,
+            uid: row.uid,
+            subject: row.subject,
+            sender: row.sender,
+            recipients: row.recipients,
+            date_text: row.date_text,
+            date_unix: row.date_unix,
+            body: row.body,
+            html_body: row.html_body,
+            attachment_count: usize::try_from(row.attachment_count).unwrap_or(0),
             attachments,
             attachment_load_error,
-            size_bytes: usize::try_from(size_bytes)?,
-            eml_path,
-        }))
+            size_bytes: usize::try_from(row.size_bytes).unwrap_or(0),
+            eml_path: row.eml_path,
+        }
     }
 
     pub fn save_attachment(
@@ -620,11 +859,45 @@ impl MailStore {
         message_id: i64,
         attachment_index: usize,
     ) -> StoreResult<Vec<u8>> {
+        match self.attachment_payload(message_id, attachment_index)? {
+            AttachmentPayload::Bytes(bytes) => Ok(bytes),
+            AttachmentPayload::Deferred(_) => Err("附件未随同步下载，需要在线拉取".into()),
+        }
+    }
+
+    pub fn attachment_payload(
+        &self,
+        message_id: i64,
+        attachment_index: usize,
+    ) -> StoreResult<AttachmentPayload> {
         let eml_path = self
             .message_detail(message_id)?
             .ok_or_else(|| format!("邮件不存在：id={message_id}"))?
             .eml_path;
-        read_attachment_bytes(&self.resolve_source_path(&eml_path), attachment_index)
+        let path = self.resolve_source_path(&eml_path);
+        let bytes = read_attachment_bytes(&path, attachment_index)?;
+        if !bytes.is_empty() {
+            return Ok(AttachmentPayload::Bytes(bytes));
+        }
+        let sidecar_path = path.with_extension("parts.json");
+        let sidecar: AttachmentSidecar = serde_json::from_slice(&fs::read(&sidecar_path)?)?;
+        let meta = read_attachment_metadata(&path).unwrap_or_default();
+        let filename = meta
+            .get(attachment_index)
+            .map(|item| item.filename.as_str())
+            .unwrap_or("");
+        let entry = sidecar
+            .attachments
+            .iter()
+            .find(|item| item.index == attachment_index || item.filename == filename)
+            .or_else(|| sidecar.attachments.get(attachment_index))
+            .ok_or_else(|| format!("parts.json 缺少附件 {attachment_index}"))?;
+        Ok(AttachmentPayload::Deferred(DeferredAttachment {
+            mailbox: sidecar.mailbox,
+            uid: sidecar.uid,
+            section: entry.section.clone(),
+            encoding: entry.encoding.clone(),
+        }))
     }
 
     fn resolve_source_path(&self, stored_path: &str) -> PathBuf {
@@ -665,19 +938,8 @@ fn read_attachment_bytes(path: &Path, attachment_index: usize) -> StoreResult<Ve
         .attachment(attachment_index)
         .ok_or_else(|| format!("附件序号越界：index={attachment_index}"))?;
 
-    Ok(match &part.body {
-        mail_parser::PartType::Binary(bytes) | mail_parser::PartType::InlineBinary(bytes) => {
-            bytes.to_vec()
-        }
-        mail_parser::PartType::Text(text) | mail_parser::PartType::Html(text) => {
-            text.as_bytes().to_vec()
-        }
-        mail_parser::PartType::Message(nested) => nested.raw_message.to_vec(),
-        mail_parser::PartType::Multipart(_) => {
-            return Err(
-                format!("附件 index={attachment_index} 是 multipart 容器，无独立载荷").into(),
-            )
-        }
+    part_payload(part).ok_or_else(|| {
+        format!("附件 index={attachment_index} 是 multipart 容器，无独立载荷").into()
     })
 }
 
@@ -690,34 +952,75 @@ fn read_attachment_metadata(path: &Path) -> StoreResult<Vec<AttachmentMeta>> {
     Ok(message
         .attachments()
         .enumerate()
-        .map(|(index, part)| {
-            let content_type = part
-                .content_type()
-                .map(|content_type| {
-                    format!(
-                        "{}/{}",
-                        content_type.ctype(),
-                        content_type.subtype().unwrap_or("octet-stream")
-                    )
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_owned());
-            let filename = part
-                .attachment_name()
-                .filter(|name| !name.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("附件 {}", index + 1));
-            let inline = part
-                .content_disposition()
-                .is_some_and(|disposition| disposition.is_inline());
-
-            AttachmentMeta {
-                filename,
-                content_type,
-                size_bytes: part.len(),
-                inline,
-            }
-        })
+        .map(|(index, part)| attachment_meta(index, part))
         .collect())
+}
+
+/// 一次读取 + 解析 `.eml`，同时返回附件元数据与全部带 Content-ID 的载荷。
+fn read_eml_assets(path: &Path) -> StoreResult<(Vec<AttachmentMeta>, HashMap<String, Vec<u8>>)> {
+    let raw = fs::read(path)?;
+    let message = MessageParser::default()
+        .parse(&raw)
+        .ok_or_else(|| format!("无法解析 RFC822/MIME 邮件：{}", path.display()))?;
+
+    let mut metadata = Vec::new();
+    let mut cid_payloads = HashMap::new();
+    for (index, part) in message.attachments().enumerate() {
+        let meta = attachment_meta(index, part);
+        if let Some(cid) = &meta.content_id {
+            if let Some(bytes) = part_payload(part) {
+                cid_payloads.insert(cid.clone(), bytes);
+            }
+        }
+        metadata.push(meta);
+    }
+    Ok((metadata, cid_payloads))
+}
+
+fn attachment_meta(index: usize, part: &mail_parser::MessagePart) -> AttachmentMeta {
+    let content_type = part
+        .content_type()
+        .map(|content_type| {
+            format!(
+                "{}/{}",
+                content_type.ctype(),
+                content_type.subtype().unwrap_or("octet-stream")
+            )
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    let filename = part
+        .attachment_name()
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("附件 {}", index + 1));
+    let inline = part
+        .content_disposition()
+        .is_some_and(|disposition| disposition.is_inline())
+        || part.content_id().is_some();
+    let content_id = part
+        .content_id()
+        .map(|value| value.trim_matches(['<', '>', ' ']).to_owned());
+
+    AttachmentMeta {
+        filename,
+        content_type,
+        size_bytes: part.len(),
+        inline,
+        content_id,
+    }
+}
+
+fn part_payload(part: &mail_parser::MessagePart) -> Option<Vec<u8>> {
+    match &part.body {
+        mail_parser::PartType::Binary(bytes) | mail_parser::PartType::InlineBinary(bytes) => {
+            Some(bytes.to_vec())
+        }
+        mail_parser::PartType::Text(text) | mail_parser::PartType::Html(text) => {
+            Some(text.as_bytes().to_vec())
+        }
+        mail_parser::PartType::Message(nested) => Some(nested.raw_message.to_vec()),
+        mail_parser::PartType::Multipart(_) => None,
+    }
 }
 
 fn import_mailbox(
@@ -806,11 +1109,11 @@ fn import_eml_file(
     let text_body = collect_bodies(message.text_body_count(), |index| {
         message.body_text(index).map(|body| body.into_owned())
     });
-    let html_body = collect_bodies(message.html_body_count(), |index| {
+    let html_body = html::sanitize_html(&collect_bodies(message.html_body_count(), |index| {
         message.body_html(index).map(|body| body.into_owned())
-    });
+    }));
     let searchable_body = if text_body.trim().is_empty() {
-        html_body.clone()
+        html::html_to_plain(&html_body)
     } else {
         text_body
     };
@@ -1173,6 +1476,67 @@ fn escape_like_pattern(query: &str) -> String {
     out
 }
 
+/// 查询是否携带真正的匹配条件（FTS 术语 / LIKE 术语 / 任一操作符），
+/// 用于区分空查询与操作符限定查询。
+fn has_positive_selector(q: &ParsedQuery) -> bool {
+    !q.fts.is_empty()
+        || !q.like_terms.is_empty()
+        || q.from.is_some()
+        || q.to.is_some()
+        || q.in_role.is_some()
+        || q.has_attachment
+}
+
+/// 由邮箱名推断角色。source_name 是 IMAP UTF-7 编码，display_name 是
+/// 解码后的名称（INBOX 保留原文，其余如 已删除/垃圾箱/已发送/草稿箱）。
+fn mailbox_role_sql(alias: &str) -> String {
+    format!(
+        "CASE
+            WHEN {a}.source_name COLLATE NOCASE = 'INBOX' THEN 'inbox'
+            WHEN {a}.display_name LIKE '%已删除%'
+                OR {a}.display_name LIKE '%Deleted%'
+                OR {a}.display_name LIKE '%Trash%' THEN 'trash'
+            WHEN {a}.display_name LIKE '%垃圾%'
+                OR {a}.display_name LIKE '%Junk%'
+                OR {a}.display_name LIKE '%Spam%' THEN 'spam'
+            WHEN {a}.display_name LIKE '%已发送%'
+                OR {a}.display_name LIKE '%Sent%' THEN 'sent'
+            WHEN {a}.display_name LIKE '%草稿%'
+                OR {a}.display_name LIKE '%Draft%' THEN 'drafts'
+            ELSE 'other'
+         END",
+        a = alias
+    )
+}
+
+fn id_in_list(ids: impl Iterator<Item = i64>) -> String {
+    ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// 发件人匹配度 [0,1]：词首/地址本地部词首命中记 1.0，纯子串 0.4。
+fn sender_match(terms: &[String], sender: &str) -> f32 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let sender = sender.to_lowercase();
+    let local = sender.split('@').next().unwrap_or("");
+    let mut total = 0.0;
+    for term in terms {
+        total += if sender
+            .split_whitespace()
+            .chain(local.split(['.', '-', '_']))
+            .any(|word| word.starts_with(term.as_str()))
+        {
+            1.0
+        } else if sender.contains(term.as_str()) {
+            0.4
+        } else {
+            0.0
+        };
+    }
+    total / terms.len() as f32
+}
+
 /// Sanitize a MIME-supplied filename into a safe single file component.
 ///
 /// Strips path separators/drive prefixes (traversal), Windows-reserved names,
@@ -1315,7 +1679,7 @@ mod tests {
     use super::{
         attachment_preview_kind, read_attachment_metadata, resolve_image_format,
         sanitized_attachment_filename, sniff_image_format, AttachmentPreviewKind, MailStore,
-        SniffedImageFormat,
+        SearchHit, SniffedImageFormat,
     };
     use rusqlite::params;
     use serde_json::json;
@@ -1411,6 +1775,80 @@ Content-Transfer-Encoding: 8bit\r\n\
         assert_eq!(hits.len(), 1);
         assert!(hits[0].subject.contains("0%"));
         assert!(hits.iter().all(|h| h.subject.contains("0%")));
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_operators_relaxation_and_exclusion() {
+        let root = temporary_directory("search-operators");
+        write_mailbox(
+            &root,
+            "alpha@example.com",
+            "INBOX",
+            42,
+            100,
+            &[
+                (7, "q3budget kickoff meeting"),
+                (8, "q3budget final report"),
+                (9, "random chatter here"),
+            ],
+        );
+        write_mailbox(
+            &root,
+            "alpha@example.com",
+            "&V4NXPnux-",
+            42,
+            100,
+            &[(10, "q3budget spam newsletter")],
+        );
+        let database = root.join("mail.sqlite");
+        let mut store = MailStore::open(&database).unwrap();
+        store.import_backup(&root).unwrap();
+
+        let uids = |hits: Vec<SearchHit>| -> Vec<u32> {
+            hits.into_iter().map(|hit| hit.uid).collect()
+        };
+
+        // AND：两术语同时命中的才保留。
+        let hits = store.search("q3budget meeting", 10).unwrap();
+        assert_eq!(uids(hits), vec![7]);
+
+        // 默认排除垃圾箱（&V4NXPnux- → 垃圾箱）。
+        let hits = store.search("q3budget", 10).unwrap();
+        let mut got = uids(hits);
+        got.sort();
+        assert_eq!(got, vec![7, 8]);
+
+        // AND 无结果 → 放宽为 OR；垃圾箱仍被默认排除。
+        let hits = store.search("q3budget meeting newsletter", 10).unwrap();
+        let mut got = uids(hits);
+        got.sort();
+        assert_eq!(got, vec![7, 8]);
+
+        // in:spam 显式纳入垃圾箱（&V4NXPnux- → 垃圾箱 → 角色 spam）。
+        let hits = store.search("in:spam q3budget", 10).unwrap();
+        assert_eq!(uids(hits), vec![10]);
+
+        // in:trash 匹配不到：夹具没有"已删除"邮箱。
+        assert!(store.search("in:trash q3budget", 10).unwrap().is_empty());
+
+        // -term 排除：meeting 被排除后只剩 report。
+        let hits = store.search("q3budget -meeting", 10).unwrap();
+        assert_eq!(uids(hits), vec![8]);
+
+        // from: 操作符。
+        let hits = store.search("from:sender q3budget", 10).unwrap();
+        let mut got = uids(hits);
+        got.sort();
+        assert_eq!(got, vec![7, 8]);
+
+        // from: 不匹配的发件人。
+        assert!(store.search("from:nobody q3budget", 10).unwrap().is_empty());
+
+        // has:attachment：夹具没有附件。
+        assert!(store.search("has:attachment q3budget", 10).unwrap().is_empty());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

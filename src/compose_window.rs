@@ -245,6 +245,8 @@ impl ComposeWindow {
             .border_color(theme.border)
             .child(
                 div()
+                    .min_w_0()
+                    .flex_1()
                     .flex()
                     .items_center()
                     .gap_3()
@@ -252,19 +254,29 @@ impl ComposeWindow {
                         control_button("send-button", theme, ButtonKind::Primary, sending)
                             .h(rems(1.875))
                             .px(rems(0.75))
+                            .flex_shrink_0()
                             .text_sm()
                             .child(if sending { "发送中…" } else { "发送" })
                             .when(!sending, |el| {
                                 el.on_click(cx.listener(|this, _, _, cx| this.attempt_send(cx)))
                             }),
                     )
-                    .child(div().text_color(status_color).text_xs().child(status)),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(status_color)
+                            .text_xs()
+                            .child(status),
+                    ),
             )
     }
 }
 
 impl Render for ComposeWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.theme = Theme::from_env();
         let theme = self.theme;
         let header_to = self.render_header_field(theme, "收件人", self.to.clone());
         let header_cc = self.render_header_field(theme, "抄送", self.cc.clone());

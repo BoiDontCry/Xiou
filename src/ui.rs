@@ -20,7 +20,7 @@ pub fn control_button(
     disabled: bool,
 ) -> Stateful<Div> {
     let (bg, fg, hover) = match kind {
-        ButtonKind::Primary => (Some(theme.accent), theme.on_accent, theme.accent),
+        ButtonKind::Primary => (Some(theme.accent), theme.on_accent, theme.accent_hover),
         ButtonKind::Secondary => (Some(theme.raised), theme.text, theme.active),
         ButtonKind::Ghost => (None, theme.text_secondary, theme.raised),
     };

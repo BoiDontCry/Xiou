@@ -548,7 +548,9 @@ impl Render for ComposerInput {
                 gpui::rems(6.0)
             })
             .w_full()
-            .when(self.single_line, |element| element.px_1())
+            .when(self.single_line, |element| {
+                element.flex().items_center().h_full().px_1()
+            })
             .when(!self.single_line, |element| {
                 element
                     .overflow_y_scroll()

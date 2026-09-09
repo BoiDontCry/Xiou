@@ -10,8 +10,10 @@ mod composer_editor;
 mod diagnostics;
 mod draft_store;
 mod paths;
+mod prefs;
 mod save_dialog;
 mod theme;
+mod tray;
 mod ui;
 
 fn main() {
@@ -41,7 +43,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-f", app::Forward, Some("MailApp")),
             KeyBinding::new("ctrl-f", app::OpenSearch, Some("MailApp")),
             KeyBinding::new("ctrl-shift-s", app::SyncNow, Some("MailApp")),
-            KeyBinding::new("ctrl-b", app::ToggleSidebar, Some("MailApp")),
+            KeyBinding::new("ctrl-,", app::OpenSettings, Some("MailApp")),
             KeyBinding::new("down", app::NextMessage, Some("MessageList")),
             KeyBinding::new("up", app::PrevMessage, Some("MessageList")),
             KeyBinding::new("j", app::NextMessage, Some("MessageList")),
@@ -55,19 +57,23 @@ fn main() {
         ]);
 
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), app);
-        app.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Foxmail Reader".into()),
-                    appears_transparent: false,
-                    traffic_light_position: None,
-                }),
-                ..Default::default()
-            },
-            |window, app| app.new(|cx| app::MailApp::new(window, cx)),
-        )
-        .expect("failed to open Foxmail Reader window");
+        let window = app
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Foxmail Reader".into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
+                    ..Default::default()
+                },
+                |window, app| app.new(|cx| app::MailApp::new(window, cx)),
+            )
+            .expect("failed to open Foxmail Reader window");
+
+        let _tray = tray::create();
+        tray::spawn_event_pump(window, app);
 
         if let Some(delay) = auto_exit_delay(std::env::var("FOXMAIL_AUTO_EXIT_MS").ok().as_deref())
         {

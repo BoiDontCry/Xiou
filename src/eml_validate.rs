@@ -82,4 +82,22 @@ AAE=\r\n\
     fn rejects_empty_input() {
         assert!(validate_bytes(b"").is_none());
     }
+
+    #[test]
+    fn decodes_gbk_encoded_subject() {
+        let raw = b"From: sender@example.com\r\n\
+To: receiver@example.com\r\n\
+Date: Mon, 17 Aug 2026 09:00:00 +0800\r\n\
+Subject: =?GBK?B?suLK1A==?=\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/plain; charset=GBK\r\n\
+Content-Transfer-Encoding: 8bit\r\n\
+\r\n\
+\xb2\xe2\xca\xd4\r\n";
+        let message = mail_parser::MessageParser::default()
+            .parse(raw.as_slice())
+            .expect("GBK message should parse");
+        assert_eq!(message.subject().unwrap(), "测试");
+        assert_eq!(message.body_text(0).unwrap().trim(), "测试");
+    }
 }

@@ -1,16 +1,23 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::credentials;
 use crate::imap_config::{HOST, PORT, USER};
 use crate::imap_errors::login_error;
-use imap::{ClientBuilder, Session};
+use crate::mime_plan::{self, DeferredAttachment, MimePlan};
+use imap::Session;
+use imap_proto::types::SectionPath;
 use imap_proto::NameAttribute;
+use mail_parser::MessageParser;
+use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct BackupOptions {
@@ -235,6 +242,28 @@ fn has_local_eml(final_path: &Path) -> bool {
     final_path.is_file()
 }
 
+pub fn connect(
+    host: &str,
+    port: u16,
+) -> Result<imap::Client<native_tls::TlsStream<TcpStream>>, Box<dyn std::error::Error>> {
+    let mut last_error: Option<Box<dyn std::error::Error>> = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, IMAP_CONNECT_TIMEOUT) {
+            Ok(tcp) => {
+                tcp.set_read_timeout(Some(IMAP_IO_TIMEOUT))?;
+                tcp.set_write_timeout(Some(IMAP_IO_TIMEOUT))?;
+                let tls = TlsConnector::builder().build()?;
+                let stream = tls.connect(host, tcp)?;
+                let mut client = imap::Client::new(stream);
+                client.read_greeting()?;
+                return Ok(client);
+            }
+            Err(error) => last_error = Some(error.into()),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("无法解析 {host}:{port}").into()))
+}
+
 /// 用默认账号（imap_config 常量）+ 环境变量/DPAPI 密码跑全量备份。
 /// 供 CLI 与 GUI 复用。`progress` 在 IMAP 网络线程的调用栈里同步回调。
 pub fn run_backup(
@@ -255,7 +284,7 @@ pub fn run_backup_with(
     progress: &mut dyn Progress,
 ) -> Result<(), Box<dyn std::error::Error>> {
     progress.connecting(host, port);
-    let client = ClientBuilder::new(host, port).connect()?;
+    let client = connect(host, port)?;
     let mut session = client
         .login(user, password)
         .map_err(|(error, _client)| login_error(error))?;
@@ -310,7 +339,7 @@ pub fn run_backup_with(
                 continue;
             }
 
-            let size = fetch_size(&mut session, uid)?;
+            let (size, plan) = fetch_size_and_plan(&mut session, uid)?;
 
             if options.dry_run {
                 mailbox_skipped += 1;
@@ -318,14 +347,25 @@ pub fn run_backup_with(
                 continue;
             }
 
-            backup_message(
-                &mut session,
-                uid,
-                size,
-                &final_path,
-                options.chunk_size,
-                progress,
-            )?;
+            match plan.filter(|plan| plan.omit_large_attachments()) {
+                Some(plan) => backup_partial(
+                    &mut session,
+                    uid,
+                    size,
+                    &mailbox_name,
+                    &plan,
+                    &final_path,
+                    progress,
+                )?,
+                None => backup_message(
+                    &mut session,
+                    uid,
+                    size,
+                    &final_path,
+                    options.chunk_size,
+                    progress,
+                )?,
+            }
             mailbox_backed_up += 1;
             total_backed_up += 1;
         }
@@ -385,6 +425,26 @@ fn resolve_mailboxes<T: Read + Write>(
     Ok(result)
 }
 
+fn fetch_size_and_plan<T: Read + Write>(
+    session: &mut Session<T>,
+    uid: u32,
+) -> Result<(u32, Option<MimePlan>), Box<dyn std::error::Error>> {
+    match session.uid_fetch(uid.to_string(), "(UID RFC822.SIZE BODYSTRUCTURE)") {
+        Ok(fetches) => {
+            let fetch = fetches
+                .iter()
+                .find(|fetch| fetch.uid == Some(uid))
+                .ok_or_else(|| format!("UID {uid} 未返回 FETCH 响应"))?;
+            let size = fetch
+                .size
+                .ok_or_else(|| format!("UID {uid} 未返回 RFC822.SIZE"))?;
+            let plan = fetch.bodystructure().map(MimePlan::from_bodystructure);
+            Ok((size, plan))
+        }
+        Err(_) => Ok((fetch_size(session, uid)?, None)),
+    }
+}
+
 fn fetch_size<T: Read + Write>(
     session: &mut Session<T>,
     uid: u32,
@@ -397,6 +457,132 @@ fn fetch_size<T: Read + Write>(
     fetch
         .size
         .ok_or_else(|| format!("UID {uid} 未返回 RFC822.SIZE").into())
+}
+
+fn backup_partial<T: Read + Write>(
+    session: &mut Session<T>,
+    uid: u32,
+    expected_size: u32,
+    mailbox: &str,
+    plan: &MimePlan,
+    final_path: &Path,
+    progress: &mut dyn Progress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = u64::from(expected_size);
+    progress.message_start(uid, expected, 0);
+
+    let mut query = String::from("(UID BODY.PEEK[HEADER]");
+    for part in &plan.texts {
+        query.push_str(" BODY.PEEK[");
+        query.push_str(&part.section);
+        query.push(']');
+    }
+    query.push(')');
+
+    let fetches = session.uid_fetch(uid.to_string(), query)?;
+    let fetch = fetches
+        .iter()
+        .find(|fetch| fetch.uid == Some(uid))
+        .ok_or_else(|| format!("UID {uid} 未返回 HEADER/正文"))?;
+    let header = fetch
+        .header()
+        .ok_or_else(|| format!("UID {uid} 未返回 HEADER"))?
+        .to_vec();
+    let mut texts = Vec::new();
+    let mut done = header.len() as u64;
+    for part in &plan.texts {
+        let path = mime_plan::section_path(&part.section)
+            .ok_or_else(|| format!("UID {uid} 无效 MIME 段 {}", part.section))?;
+        let bytes = fetch
+            .section(&path)
+            .ok_or_else(|| format!("UID {uid} 未返回 BODY[{}]", part.section))?
+            .to_vec();
+        done += bytes.len() as u64;
+        texts.push(bytes);
+    }
+    progress.message_progress(uid, done.min(expected), expected);
+
+    let eml = mime_plan::build_partial_eml(&header, plan, &texts);
+    let part_path = final_path.with_extension("eml.part");
+    fs::write(&part_path, &eml)?;
+    let sidecar = serde_json::to_vec_pretty(&plan.sidecar(mailbox, uid))?;
+    fs::write(final_path.with_extension("parts.json"), sidecar)?;
+    if final_path.exists() {
+        fs::remove_file(final_path)?;
+    }
+    fs::rename(part_path, final_path)?;
+    progress.message_progress(uid, expected, expected);
+    Ok(())
+}
+
+pub fn fetch_deferred_attachment(
+    deferred: &DeferredAttachment,
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let client = connect(host, port)?;
+    let mut session = client
+        .login(user, password)
+        .map_err(|(error, _client)| login_error(error))?;
+    session.examine(&deferred.mailbox)?;
+    let path = mime_plan::section_path(&deferred.section)
+        .ok_or_else(|| format!("无效 MIME 段 {}", deferred.section))?;
+    let raw = fetch_section(&mut session, deferred.uid, &path)?;
+    session.logout()?;
+    decode_transfer(&raw, &deferred.encoding)
+}
+
+fn fetch_section<T: Read + Write>(
+    session: &mut Session<T>,
+    uid: u32,
+    path: &SectionPath,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let section = match path {
+        SectionPath::Part(parts, None) => parts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => return Err("不支持的 MIME 段".into()),
+    };
+    let query = format!("(UID BODY.PEEK[{section}])");
+    let fetches = session.uid_fetch(uid.to_string(), query)?;
+    let fetch = fetches
+        .iter()
+        .find(|fetch| fetch.uid == Some(uid))
+        .ok_or_else(|| format!("UID {uid} 未返回 BODY[{section}]"))?;
+    Ok(fetch
+        .section(path)
+        .ok_or_else(|| format!("UID {uid} BODY[{section}] 为空"))?
+        .to_vec())
+}
+
+fn decode_transfer(data: &[u8], encoding: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "" | "7bit" | "8bit" | "binary" => Ok(data.to_vec()),
+        encoding => {
+            let mut wrapped = format!(
+                "From: decoder@local\r\nMIME-Version: 1.0\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=part.bin\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
+            )
+            .into_bytes();
+            wrapped.extend_from_slice(data);
+            let message = MessageParser::default()
+                .parse(&wrapped)
+                .ok_or("无法解码附件传输编码")?;
+            let part = message.attachment(0).ok_or("解码后没有附件载荷")?;
+            Ok(match &part.body {
+                mail_parser::PartType::Binary(bytes)
+                | mail_parser::PartType::InlineBinary(bytes) => bytes.to_vec(),
+                mail_parser::PartType::Text(text) | mail_parser::PartType::Html(text) => {
+                    text.as_bytes().to_vec()
+                }
+                mail_parser::PartType::Message(nested) => nested.raw_message.to_vec(),
+                mail_parser::PartType::Multipart(_) => return Err("附件是 multipart 容器".into()),
+            })
+        }
+    }
 }
 
 fn backup_message<T: Read + Write>(
@@ -542,6 +728,13 @@ mod tests {
         assert_eq!(uid_search_criteria(Some(0)), "UID 1:*");
         assert_eq!(uid_search_criteria(Some(100)), "UID 101:*");
         assert_eq!(uid_search_criteria(Some(u32::MAX)), "ALL");
+    }
+
+    #[test]
+    fn imap_timeouts_are_bounded() {
+        assert_eq!(IMAP_CONNECT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(IMAP_IO_TIMEOUT, Duration::from_secs(60));
+        assert!(IMAP_CONNECT_TIMEOUT <= IMAP_IO_TIMEOUT);
     }
 
     #[test]
