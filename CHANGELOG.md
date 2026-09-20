@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### GPUI migration E9 closeout — 2026-09-20 (unreleased)
+
+- Removed the last migration remnant: the standalone `spike-gpui-kit` bin
+  (`src/spike_gpui_kit.rs`) and its Cargo entry; no other old-widget code
+  remains.
+- Fixed a native-test regression introduced on 2026-09-18: the
+  `overflow_x_scrollbar` wrapper rewrites the wrapped element's id, which
+  detached the `mail-cid-image` test marker from the element tree and failed
+  the E7 CID assertions. The marker id now lives on the stable outer image
+  container; horizontal scrolling and render sizing are unchanged.
+- Re-ran all four gates after cleanup: check/build pass, 111 unit tests and
+  226 native GPUI records pass (same count as the 2026-09-14 baseline).
+- Cargo.lock re-verified against `Cargo.toml` with `--locked --offline`.
+- Measured an isolated E9 candidate (`target/e9-20260920/release/xiou.exe`,
+  30.86 MiB) with 10,013 synthetic messages: startup peak working set
+  85.38–89.58 MiB, 10-minute dwell stable with no leak trend; no budget
+  numbers were invented. Real-OS interaction was accepted by manual use
+  (`docs/GPUI-NATIVE-ACCEPTANCE.md`, `native-acceptance-20260920.md`).
+- Not done in this batch: formal packaging and any budget-based acceptance;
+  SMTP remains a fixed-config PoC.
+
+### GPUI migration follow-up — 2026-09-14 (unreleased)
+
+- Continued the E6/E7 implementation with E8 visual acceptance; this is not a
+  completed native-OS acceptance or a published release.
+- Fixed sidebar row overlap by placing ListItem content in an explicit flex row.
+- Embedded the 12 additional mail SVGs required by the shared icon catalog while
+  retaining official component assets; source-inventory tests cover all used icons.
+- Fixed stale Component resolved tokens after theme changes, including buttons,
+  dialogs, selection, progress and sliders; verify real composer button pixels.
+- Added isolated E8 native geometry and four-theme/workspace/icon captures.
+  Current verification: 108 unit tests and 226 native records passed; the exact
+  83-PNG set was visually reviewed with remaining OS/DPI/image-quality gates explicit.
+- Built an isolated 30.20 MiB release candidate without replacing the existing
+  release; 3 index-only runs with 10,007 synthetic messages observed 69.19–69.23 MiB
+  peak sampled working set. This is not a scrolling or lifetime-memory budget pass.
+- Updated migration, usage and release documentation; SMTP remains a fixed-config
+  PoC, and IMAP account setup does not yet imply generic multi-account sending.
+
+
 ### Added
 
 - Added the GPUI desktop reader entry point and a real mailbox tree backed by the M2 SQLite index.

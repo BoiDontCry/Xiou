@@ -1,42 +1,42 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
-use gpui_platform::application;
 use std::time::Duration;
 
 mod app;
 mod compose_window;
-mod composer_editor;
 mod diagnostics;
 mod draft_store;
+mod feedback;
+mod fox_theme;
+mod mail_body;
+mod navigation;
 mod paths;
 mod prefs;
 mod save_dialog;
+mod single_instance;
 mod theme;
 mod tray;
 mod ui;
 
 fn main() {
-    application().run(|app: &mut App| {
+    let _single_instance = match single_instance::acquire() {
+        single_instance::AcquireResult::Acquired(guard) => guard,
+        single_instance::AcquireResult::AlreadyRunning => return,
+        single_instance::AcquireResult::Unavailable => {
+            eprintln!("single-instance guard unavailable; continuing");
+            single_instance::SingleInstance::noop()
+        }
+    };
+
+    ui::application().run(|app: &mut App| {
+        gpui_kit::init(app);
+        app.bind_keys(app::search_key_bindings());
+        app.bind_keys(app::navigation_key_bindings());
         app.bind_keys([
-            KeyBinding::new("backspace", composer_editor::Backspace, None),
-            KeyBinding::new("delete", composer_editor::Delete, None),
-            KeyBinding::new("left", composer_editor::Left, None),
-            KeyBinding::new("right", composer_editor::Right, None),
-            KeyBinding::new("up", composer_editor::Up, None),
-            KeyBinding::new("down", composer_editor::Down, None),
-            KeyBinding::new("shift-left", composer_editor::SelectLeft, None),
-            KeyBinding::new("shift-right", composer_editor::SelectRight, None),
-            KeyBinding::new("ctrl-a", composer_editor::SelectAll, None),
-            KeyBinding::new("ctrl-v", composer_editor::Paste, None),
-            KeyBinding::new("ctrl-c", composer_editor::Copy, None),
-            KeyBinding::new("ctrl-x", composer_editor::Cut, None),
-            KeyBinding::new("home", composer_editor::Home, None),
-            KeyBinding::new("end", composer_editor::End, None),
-            KeyBinding::new("enter", composer_editor::Newline, None),
             KeyBinding::new("escape", compose_window::CloseCompose, Some("Compose")),
             KeyBinding::new("ctrl-enter", compose_window::SendCompose, Some("Compose")),
-            KeyBinding::new("escape", app::ClosePreview, Some("Preview")),
+            compose_window::input_send_binding(),
             KeyBinding::new("escape", app::DismissOverlay, Some("MailApp")),
             KeyBinding::new("ctrl-n", app::Compose, Some("MailApp")),
             KeyBinding::new("ctrl-r", app::Reply, Some("MailApp")),
@@ -44,16 +44,6 @@ fn main() {
             KeyBinding::new("ctrl-f", app::OpenSearch, Some("MailApp")),
             KeyBinding::new("ctrl-shift-s", app::SyncNow, Some("MailApp")),
             KeyBinding::new("ctrl-,", app::OpenSettings, Some("MailApp")),
-            KeyBinding::new("down", app::NextMessage, Some("MessageList")),
-            KeyBinding::new("up", app::PrevMessage, Some("MessageList")),
-            KeyBinding::new("j", app::NextMessage, Some("MessageList")),
-            KeyBinding::new("k", app::PrevMessage, Some("MessageList")),
-            KeyBinding::new("enter", app::ConfirmSelection, Some("MessageList")),
-            KeyBinding::new("down", app::NextMailbox, Some("MailboxList")),
-            KeyBinding::new("up", app::PrevMailbox, Some("MailboxList")),
-            KeyBinding::new("j", app::NextMailbox, Some("MailboxList")),
-            KeyBinding::new("k", app::PrevMailbox, Some("MailboxList")),
-            KeyBinding::new("enter", app::ConfirmSelection, Some("MailboxList")),
         ]);
 
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), app);
@@ -62,18 +52,21 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Foxmail Reader".into()),
+                        title: Some("Xiou".into()),
                         appears_transparent: false,
                         traffic_light_position: None,
                     }),
                     ..Default::default()
                 },
-                |window, app| app.new(|cx| app::MailApp::new(window, cx)),
+                |window, app| {
+                    let view = app.new(|cx| app::MailApp::new(window, cx));
+                    ui::root_view(view, window, app)
+                },
             )
-            .expect("failed to open Foxmail Reader window");
+            .expect("failed to open Xiou window");
 
-        let _tray = tray::create();
-        tray::spawn_event_pump(window, app);
+        tray::install(app);
+        tray::spawn_event_pump(window.into(), app);
 
         if let Some(delay) = auto_exit_delay(std::env::var("FOXMAIL_AUTO_EXIT_MS").ok().as_deref())
         {

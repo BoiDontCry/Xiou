@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{App, AsyncApp, WindowHandle};
+use gpui::{AnyWindowHandle, App, AsyncApp, Global};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE};
+use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE, SW_RESTORE};
 
 const OPEN_ID: &str = "tray-open";
 const QUIT_ID: &str = "tray-quit";
@@ -18,6 +18,21 @@ enum Command {
 
 pub struct Tray {
     _icon: TrayIcon,
+}
+
+/// Keeps the native tray icon alive for the whole GPUI application lifetime.
+///
+/// `tray-icon` owns the Windows notification-area handle through `TrayIcon`;
+/// dropping it immediately after startup makes the icon disappear and leaves
+/// no native event source for the pump below.
+pub struct TrayState {
+    _tray: Tray,
+}
+
+impl Global for TrayState {}
+
+pub fn install(app: &mut App) {
+    app.set_global(TrayState { _tray: create() });
 }
 
 pub fn create() -> Tray {
@@ -49,8 +64,20 @@ pub fn hide_window(window: &gpui::Window) {
     }
 }
 
+/// Restore a window hidden by `hide_window` and bring it to the foreground.
+pub fn show_window(window: &gpui::Window) {
+    let Some(hwnd) = crate::save_dialog::native_hwnd(window) else {
+        window.activate_window();
+        return;
+    };
+    unsafe {
+        let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+    }
+    window.activate_window();
+}
+
 /// 托盘左键 / 菜单事件 → 主线程（150ms 轮询，事件频率是人手速，够用）。
-pub fn spawn_event_pump(window: WindowHandle<crate::app::MailApp>, app: &mut App) {
+pub fn spawn_event_pump(window: AnyWindowHandle, app: &mut App) {
     let menu_rx = MenuEvent::receiver().clone();
     let tray_rx = TrayIconEvent::receiver().clone();
     app.spawn(async move |cx: &mut AsyncApp| {
@@ -84,7 +111,7 @@ pub fn spawn_event_pump(window: WindowHandle<crate::app::MailApp>, app: &mut App
                 .await;
             match command {
                 Some(Command::Show) => {
-                    let _ = window.update(cx, |_, window, _| window.activate_window());
+                    let _ = window.update(cx, |_, window, _| show_window(window));
                 }
                 Some(Command::Quit) => {
                     let _ = cx.update(|app| app.quit());
@@ -103,11 +130,11 @@ pub fn spawn_event_pump(window: WindowHandle<crate::app::MailApp>, app: &mut App
 fn ico_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("foxmail-rs.ico");
+            let candidate = dir.join("xiou.ico");
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("foxmail-rs.ico")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("xiou.ico")
 }

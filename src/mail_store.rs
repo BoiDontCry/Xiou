@@ -679,6 +679,22 @@ impl MailStore {
         Ok(accounts)
     }
 
+    /// Return the position in the same stable order as message_page without
+    /// loading every preceding row. NULL dates sort after dated messages.
+    pub fn message_position(&self, mailbox_id: i64, message_id: i64) -> StoreResult<Option<usize>> {
+        let target: Option<(Option<i64>, u32)> = self.connection.query_row(
+            "SELECT date_unix, uid FROM message WHERE mailbox_id = ?1 AND id = ?2",
+            params![mailbox_id,message_id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional()?;
+        let Some((date,uid))=target else { return Ok(None); };
+        let position: i64=self.connection.query_row(
+            "SELECT COUNT(*) FROM message WHERE mailbox_id = ?1 AND
+             ((?2 IS NULL AND date_unix IS NOT NULL) OR date_unix > ?2 OR (date_unix IS ?2 AND uid > ?3))",
+            params![mailbox_id,date,uid], |row| row.get(0),
+        )?;
+        Ok(Some(usize::try_from(position)?))
+    }
+
     pub fn message_page(
         &self,
         mailbox_id: i64,
@@ -1540,7 +1556,7 @@ fn sender_match(terms: &[String], sender: &str) -> f32 {
 /// Sanitize a MIME-supplied filename into a safe single file component.
 ///
 /// Strips path separators/drive prefixes (traversal), Windows-reserved names,
-/// and control characters; falls back to `attachment.bin`.
+/// and Windows-invalid/control characters; falls back to `attachment.bin`.
 pub fn sanitized_attachment_filename(filename: &str) -> String {
     let name = filename
         .rsplit(['/', '\\'])
@@ -1548,7 +1564,9 @@ pub fn sanitized_attachment_filename(filename: &str) -> String {
         .unwrap_or_default()
         .trim()
         .chars()
-        .filter(|character| !character.is_control() && *character != ':' && *character != '"')
+        .filter(|character| {
+            !character.is_control() && !matches!(*character, ':' | '"' | '<' | '>' | '|' | '?' | '*')
+        })
         .collect::<String>()
         .trim()
         .to_owned();
@@ -2090,6 +2108,25 @@ AAE=\r\n\
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attachment_names_strip_all_windows_invalid_characters() {
+        for invalid in ['<', '>', ':', '"', '|', '?', '*', '\0', '\n'] {
+            let input = format!("报告{invalid}最终版.txt");
+            assert_eq!(sanitized_attachment_filename(&input), "报告最终版.txt");
+        }
+        assert_eq!(sanitized_attachment_filename("../../unsafe?.bin"), "unsafe.bin");
+        assert_eq!(sanitized_attachment_filename("<>|?*"), "attachment.bin");
+    }
+
+    #[test]
+    fn invalid_character_removal_cannot_disguise_device_names() {
+        for input in ["C?ON.txt", "LPT*1.log", "A<U>X", "N|UL.bin"] {
+            assert_eq!(sanitized_attachment_filename(input), "attachment.bin");
+        }
+        assert_eq!(sanitized_attachment_filename("COM10.txt"), "COM10.txt");
+        assert_eq!(sanitized_attachment_filename("正常报告🙂.txt"), "正常报告🙂.txt");
     }
 
     #[test]

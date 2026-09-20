@@ -5,18 +5,41 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::path::PathBuf;
 use windows::core::HSTRING;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::UI::Shell::{
     FileSaveDialog, IFileSaveDialog, FILEOPENDIALOGOPTIONS, FOS_OVERWRITEPROMPT, SIGDN_FILESYSPATH,
 };
 
 /// Show a modal native "save as" dialog owned by the given window.
-/// Returns the chosen path, or `None` if the user cancelled.
-pub fn prompt_save_path(window: &Window, suggested_filename: &str) -> Option<PathBuf> {
-    let hwnd = native_hwnd(window)?;
-    // SAFETY: COM is initialized on this thread by GPUI (OleInitialize); dialog
-    // shown modally against our own window handle.
-    unsafe { show_dialog(hwnd, suggested_filename) }.ok()
+/// `Ok(None)` = user cancelled; `Err` = the dialog genuinely failed (HRESULT
+/// included) — callers must surface this instead of treating it as a cancel.
+pub fn prompt_save_path(
+    window: &Window,
+    suggested_filename: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(hwnd) = native_hwnd(window) else {
+        return Err("无法获取主窗口句柄，无法打开保存对话框".into());
+    };
+    // Self-guard STA: GPUI initializes OLE on the UI thread (OleInitialize,
+    // STA-compliant); S_FALSE/RPC_E_CHANGED_MODE must not be silently swallowed.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let owns_init = hr.is_ok();
+    let result = unsafe { show_dialog(hwnd, suggested_filename) };
+    if owns_init {
+        unsafe { CoUninitialize() };
+    }
+    match result {
+        Ok(path) => Ok(Some(path)),
+        // HRESULT_FROM_WIN32(ERROR_CANCELLED) = 0x800704C7
+        Err(error) if error.code().0 == 0x8007_04C7u32 as i32 => Ok(None),
+        Err(error) => Err(format!(
+            "保存对话框打开失败（HRESULT {:08X}）：{error}",
+            error.code().0 as u32
+        )),
+    }
 }
 
 pub(crate) fn native_hwnd(window: &Window) -> Option<HWND> {

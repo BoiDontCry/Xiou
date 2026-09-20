@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 const APP_DIR: &str = "foxmail-rs";
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DraftData {
     pub to: String,
     pub cc: String,

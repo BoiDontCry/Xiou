@@ -1,15 +1,17 @@
-use crate::composer_editor::{ComposerEvent, ComposerInput, ComposerInputOptions};
 use crate::draft_store::{self, DraftData};
+use crate::feedback::{self, Feedback, NoticeKind, NoticeLevel};
 use crate::theme::Theme;
 use crate::ui::{control_button, rems, ButtonKind};
 use foxmail_imap::credentials;
 use foxmail_imap::mail_store::MessageDetail;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    actions, div, px, size, App, AppContext, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    WindowBounds, WindowOptions,
+    actions, div, px, size, App, AppContext, Bounds, Context, Entity, EntityInputHandler,
+    EventEmitter, Focusable as _, InteractiveElement, IntoElement, KeyBinding, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions,
 };
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -19,6 +21,13 @@ pub const SMTP_PORT: u16 = 465;
 pub const FROM_ADDR: &str = "zhangwei@szshuori.com";
 
 actions!(compose, [CloseCompose, SendCompose]);
+
+/// Override the library's secondary-enter only inside composer inputs. On
+/// Windows it is the same key as ctrl-enter; the more specific, later binding
+/// must run before Textarea inserts a newline and emits PressEnter.
+pub fn input_send_binding() -> KeyBinding {
+    KeyBinding::new("secondary-enter", SendCompose, Some("Compose > Input"))
+}
 
 #[derive(Clone, Debug)]
 pub enum ComposeKind {
@@ -45,26 +54,66 @@ pub struct ForwardDraft {
 #[derive(Clone, Debug)]
 enum SendState {
     Idle,
-    Sending,
-    Success(String),
+    Sending {
+        generation: u64,
+        snapshot: DraftData,
+    },
+    Success {
+        detail: String,
+        warning: Option<String>,
+    },
     Failed(String),
 }
 
 pub struct ComposeWindow {
     theme: Theme,
     kind: ComposeKind,
-    to: Entity<ComposerInput>,
-    cc: Entity<ComposerInput>,
-    subject: Entity<ComposerInput>,
-    body: Entity<ComposerInput>,
+    to: Entity<InputState>,
+    cc: Entity<InputState>,
+    subject: Entity<InputState>,
+    body: Entity<TextareaState>,
     send_state: SendState,
+    send_generation: u64,
+    draft_error: Option<SharedString>,
+    feedback: Feedback,
     _input_subscriptions: Vec<gpui::Subscription>,
 }
 
 impl ComposeWindow {
-    pub fn open(kind: ComposeKind, app: &mut App) {
-        let (to, cc, subject, body_initial) = draft_fields(&kind);
+    fn new(kind: ComposeKind, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (to_initial, cc_initial, subject_initial, body_initial) = draft_fields(&kind);
 
+        let to = cx.new(|cx| InputState::new(window, cx).placeholder("输入收件人地址"));
+        to.update(cx, |state, cx| state.set_value(to_initial, window, cx));
+        let cc = cx.new(|cx| InputState::new(window, cx).placeholder("输入抄送地址，可用逗号分隔"));
+        cc.update(cx, |state, cx| state.set_value(cc_initial, window, cx));
+        let subject = cx.new(|cx| InputState::new(window, cx).placeholder("输入主题"));
+        subject.update(cx, |state, cx| state.set_value(subject_initial, window, cx));
+        let body = cx.new(|cx| TextareaState::new(window, cx).placeholder("在这里输入邮件正文…"));
+        body.update(cx, |state, cx| state.set_value(body_initial, window, cx));
+        let input_subscriptions = vec![
+            subscribe_input(cx, &to),
+            subscribe_input(cx, &cc),
+            subscribe_input(cx, &subject),
+            subscribe_input(cx, &body),
+        ];
+        window.focus(&to.read(cx).focus_handle(cx), cx);
+        Self {
+            theme: Theme::from_env(),
+            kind,
+            to,
+            cc,
+            subject,
+            body,
+            send_state: SendState::Idle,
+            send_generation: 0,
+            draft_error: None,
+            feedback: Feedback::default(),
+            _input_subscriptions: input_subscriptions,
+        }
+    }
+
+    pub fn open(kind: ComposeKind, app: &mut App) {
         let bounds = Bounds::centered(None, size(px(720.), px(560.)), app);
         let _ = app.open_window(
             WindowOptions {
@@ -77,57 +126,8 @@ impl ComposeWindow {
                 ..Default::default()
             },
             |window, app| {
-                app.new(|cx| {
-                    let to = cx.new(|cx| {
-                        ComposerInput::new(
-                            window,
-                            cx,
-                            to.clone(),
-                            ComposerInputOptions::single_line("输入收件人地址"),
-                        )
-                    });
-                    let cc = cx.new(|cx| {
-                        ComposerInput::new(
-                            window,
-                            cx,
-                            cc.clone(),
-                            ComposerInputOptions::single_line("输入抄送地址，可用逗号分隔"),
-                        )
-                    });
-                    let subject = cx.new(|cx| {
-                        ComposerInput::new(
-                            window,
-                            cx,
-                            subject.clone(),
-                            ComposerInputOptions::single_line("输入主题"),
-                        )
-                    });
-                    let body = cx.new(|cx| {
-                        ComposerInput::new(
-                            window,
-                            cx,
-                            body_initial.clone(),
-                            ComposerInputOptions::multiline("在这里输入邮件正文…"),
-                        )
-                    });
-                    let input_subscriptions = vec![
-                        subscribe_input(cx, &to),
-                        subscribe_input(cx, &cc),
-                        subscribe_input(cx, &subject),
-                        subscribe_input(cx, &body),
-                    ];
-                    window.focus(&to.read(cx).focus_handle(), cx);
-                    Self {
-                        theme: Theme::from_env(),
-                        kind,
-                        to,
-                        cc,
-                        subject,
-                        body,
-                        send_state: SendState::Idle,
-                        _input_subscriptions: input_subscriptions,
-                    }
-                })
+                let view = app.new(|cx| Self::new(kind, window, cx));
+                crate::ui::root_view(view, window, app)
             },
         );
     }
@@ -140,64 +140,224 @@ impl ComposeWindow {
         Self::open(ComposeKind::Forward(forward_draft(detail)), app);
     }
 
-    fn attempt_send(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.send_state, SendState::Sending) {
+    fn attempt_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((generation, snapshot)) = self.begin_send(window, cx) else {
             return;
-        }
-        let to = self.to.read(cx).content().trim().to_string();
-        let subject = self.subject.read(cx).content().trim().to_string();
-        let body = self.body.read(cx).content().to_string();
-        if to.is_empty() {
-            self.send_state = SendState::Failed("收件人不能为空".into());
-            cx.notify();
-            return;
-        }
-        if body.trim().is_empty() {
-            self.send_state = SendState::Failed("正文不能为空".into());
-            cx.notify();
-            return;
-        }
-        self.send_state = SendState::Sending;
-        cx.notify();
+        };
+        let request = snapshot.clone();
+        let task = cx.background_executor().spawn(async move {
+            send_email(
+                request.to.trim(),
+                request.cc.trim(),
+                request.subject.trim(),
+                &request.body,
+            )
+        });
+        self.dispatch_send(generation, snapshot, task, cx);
+    }
 
-        let cc = self.cc.read(cx).content().trim().to_string();
-        let task = cx
-            .background_executor()
-            .spawn(async move { send_email(&to, &cc, &subject, &body) });
+    fn begin_send(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(u64, DraftData)> {
+        if matches!(self.send_state, SendState::Sending { .. })
+            || input_is_composing(&self.to, window, cx)
+            || input_is_composing(&self.cc, window, cx)
+            || input_is_composing(&self.subject, window, cx)
+            || input_is_composing(&self.body, window, cx)
+        {
+            return None;
+        }
+        let snapshot = current_draft(self, cx);
+        if snapshot.to.trim().is_empty() {
+            self.reject_send("收件人不能为空", cx);
+            return None;
+        }
+        if snapshot.body.trim().is_empty() {
+            self.reject_send("正文不能为空", cx);
+            return None;
+        }
+        self.save_current_draft(cx);
+        self.send_generation = self.send_generation.wrapping_add(1);
+        let generation = self.send_generation;
+        self.send_state = SendState::Sending {
+            generation,
+            snapshot: snapshot.clone(),
+        };
+        cx.notify();
+        Some((generation, snapshot))
+    }
+
+    fn reject_send(&mut self, error: &str, cx: &mut Context<Self>) {
+        let repeated = matches!(&self.send_state, SendState::Failed(previous) if previous == error);
+        self.send_state = SendState::Failed(error.to_owned());
+        if !repeated {
+            self.feedback.push(
+                NoticeKind::Send,
+                NoticeLevel::Error,
+                "无法发送",
+                error.to_owned(),
+            );
+        }
+        cx.notify();
+    }
+
+    // The SMTP adapter and offline tests both deliver results through this
+    // same callback. Tests supply a local Task, never a real SMTP transport.
+    fn dispatch_send(
+        &self,
+        generation: u64,
+        snapshot: DraftData,
+        task: gpui::Task<Result<String, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = draft_key(&self.kind);
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| {
-                this.send_state = match result {
-                    Ok(info) => {
-                        let _ = draft_store::remove(&draft_key(&this.kind));
-                        SendState::Success(info)
-                    }
-                    Err(error) => SendState::Failed(error),
-                };
-                cx.notify();
-            })
-            .ok();
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.complete_send(generation, result, cx));
+            } else if result.is_ok() {
+                // Closing the compose window does not mean the SMTP job was
+                // cancelled. Only remove an unchanged transmitted snapshot;
+                // another window's/newer draft must survive.
+                let _ = clear_sent_draft(&key, &snapshot);
+            }
         })
         .detach();
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
-        cx.dispatch_action(&CloseCompose);
+    fn complete_send(
+        &mut self,
+        generation: u64,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let SendState::Sending {
+            generation: active,
+            snapshot,
+        } = &self.send_state
+        else {
+            return;
+        };
+        if generation != *active {
+            return;
+        }
+        let snapshot = snapshot.clone();
+        match result {
+            Ok(info) => {
+                let cleanup = if current_draft(self, cx) == snapshot {
+                    clear_sent_draft(&draft_key(&self.kind), &snapshot)
+                } else {
+                    Ok(false)
+                };
+                let (detail, warning) = match cleanup {
+                    Ok(true) => (info, None),
+                    Ok(false) => (format!("{info}；发送期间的新修改未被清空。"), None),
+                    Err(error) => (
+                        info,
+                        Some(format!(
+                            "本地草稿清理失败：{error}。邮件已发送，请勿重复发送。"
+                        )),
+                    ),
+                };
+                let level = if warning.is_some() {
+                    NoticeLevel::Warning
+                } else {
+                    NoticeLevel::Success
+                };
+                let message = warning.clone().unwrap_or_else(|| detail.clone());
+                self.send_state = SendState::Success { detail, warning };
+                self.feedback
+                    .push(NoticeKind::Send, level, "邮件已发送", message);
+            }
+            Err(error) => {
+                self.send_state = SendState::Failed(error.clone());
+                self.feedback
+                    .push(NoticeKind::Send, NoticeLevel::Error, "发送失败", error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn save_current_draft(&mut self, cx: &mut Context<Self>) {
+        match persist_draft(self, cx) {
+            Ok(()) => {
+                if self.draft_error.take().is_some() {
+                    self.feedback.push(
+                        NoticeKind::Draft,
+                        NoticeLevel::Info,
+                        "草稿已恢复保存",
+                        "本地草稿保存已恢复，当前修改已保存。",
+                    );
+                }
+            }
+            Err(error) => {
+                let message: SharedString =
+                    format!("草稿保存失败：{error}。关闭窗口前请保留正文副本。").into();
+                if self.draft_error.as_ref() != Some(&message) {
+                    self.feedback.push(
+                        NoticeKind::Draft,
+                        NoticeLevel::Error,
+                        "草稿未保存",
+                        message.clone(),
+                    );
+                }
+                self.draft_error = Some(message);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_send_status(&self) -> Option<gpui::AnyElement> {
+        let (level, message, busy) = match &self.send_state {
+            SendState::Idle => return None,
+            SendState::Sending { .. } => (
+                NoticeLevel::Info,
+                "正在发送，等待服务器确认…".to_owned(),
+                true,
+            ),
+            SendState::Success { detail, warning } => (
+                if warning.is_some() {
+                    NoticeLevel::Warning
+                } else {
+                    NoticeLevel::Success
+                },
+                warning
+                    .clone()
+                    .unwrap_or_else(|| format!("已发送：{detail}")),
+                false,
+            ),
+            SendState::Failed(error) => (NoticeLevel::Error, format!("发送失败：{error}"), false),
+        };
+        Some(
+            div()
+                .id("send-status-region")
+                .test_support()
+                .flex_shrink_0()
+                .max_h(rems(6.))
+                .overflow_y_scroll()
+                .child(feedback::alert("send-status", level, message).banner())
+                .when(busy, |panel| {
+                    panel.child(feedback::progress("send-progress", None, "邮件发送进度"))
+                })
+                .into_any_element(),
+        )
     }
 
     fn close_window(&mut self, _: &CloseCompose, window: &mut Window, _: &mut Context<Self>) {
         window.remove_window();
     }
 
-    fn send_from_action(&mut self, _: &SendCompose, _: &mut Window, cx: &mut Context<Self>) {
-        self.attempt_send(cx);
+    fn send_from_action(&mut self, _: &SendCompose, window: &mut Window, cx: &mut Context<Self>) {
+        self.attempt_send(window, cx);
     }
 
     fn render_header_field(
         &self,
         theme: Theme,
         label: &str,
-        input: Entity<ComposerInput>,
+        input: Entity<InputState>,
     ) -> impl IntoElement {
         let label_text: SharedString = label.to_owned().into();
         div()
@@ -217,65 +377,50 @@ impl ComposeWindow {
                     .text_xs()
                     .child(label_text),
             )
-            .child(div().flex_1().min_w_0().h_full().child(input))
+            .child(
+                div().flex_1().min_w_0().h_full().child(
+                    Input::new(&input)
+                        .appearance(false)
+                        .bordered(false)
+                        .h_full(),
+                ),
+            )
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let sending = matches!(self.send_state, SendState::Sending);
-        let status_color = match &self.send_state {
-            SendState::Idle => theme.text_tertiary,
-            SendState::Sending => theme.info,
-            SendState::Success(_) => theme.success,
-            SendState::Failed(_) => theme.danger,
-        };
-        let status: SharedString = match &self.send_state {
-            SendState::Idle => "Ctrl/Cmd+Enter 发送 · Esc 关闭".into(),
-            SendState::Sending => "正在发送…".into(),
-            SendState::Success(info) => format!("已发送：{}", info).into(),
-            SendState::Failed(error) => format!("发送失败：{}", error).into(),
-        };
+        let sending = matches!(self.send_state, SendState::Sending { .. });
         div()
             .h(rems(3.))
             .px_4()
             .flex()
             .items_center()
-            .justify_between()
+            .gap_3()
             .border_b_1()
             .border_color(theme.border)
             .child(
+                control_button("send-button", theme, ButtonKind::Primary, sending)
+                    .h(rems(1.875))
+                    .px(rems(0.75))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .child(if sending { "发送中…" } else { "发送" })
+                    .on_click(cx.listener(|this, _, window, cx| this.attempt_send(window, cx))),
+            )
+            .child(
                 div()
                     .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        control_button("send-button", theme, ButtonKind::Primary, sending)
-                            .h(rems(1.875))
-                            .px(rems(0.75))
-                            .flex_shrink_0()
-                            .text_sm()
-                            .child(if sending { "发送中…" } else { "发送" })
-                            .when(!sending, |el| {
-                                el.on_click(cx.listener(|this, _, _, cx| this.attempt_send(cx)))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_color(status_color)
-                            .text_xs()
-                            .child(status),
-                    ),
+                    .truncate()
+                    .text_color(theme.text_tertiary)
+                    .text_xs()
+                    .child("Ctrl/Cmd+Enter 发送 · Esc 关闭"),
             )
     }
 }
 
 impl Render for ComposeWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.feedback.flush(window, cx);
         self.theme = Theme::from_env();
         let theme = self.theme;
         let header_to = self.render_header_field(theme, "收件人", self.to.clone());
@@ -284,6 +429,7 @@ impl Render for ComposeWindow {
         let body = self.body.clone();
 
         div()
+            .relative()
             .size_full()
             .key_context("Compose")
             .on_action(cx.listener(Self::close_window))
@@ -293,15 +439,29 @@ impl Render for ComposeWindow {
             .flex()
             .flex_col()
             .child(self.render_toolbar(cx))
+            .children(self.render_send_status())
+            .when_some(self.draft_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .id("draft-save-status-region")
+                        .test_support()
+                        .max_h(rems(5.))
+                        .overflow_y_scroll()
+                        .child(
+                            feedback::alert("draft-save-error", NoticeLevel::Error, error).banner(),
+                        ),
+                )
+            })
             .child(header_to)
             .child(header_cc)
             .child(header_subject)
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(theme.surface)
-                    .child(body.clone()),
+                div().flex_1().min_h_0().bg(theme.surface).child(
+                    Textarea::new(&body)
+                        .appearance(false)
+                        .bordered(false)
+                        .size_full(),
+                ),
             )
             .child(
                 div()
@@ -315,6 +475,7 @@ impl Render for ComposeWindow {
                     .text_xs()
                     .child(compose_hint(&self.kind)),
             )
+            .children(crate::ui::overlay_layers(window, cx))
     }
 }
 
@@ -356,14 +517,28 @@ fn draft_key(kind: &ComposeKind) -> String {
     }
 }
 
-fn persist_draft(window: &ComposeWindow, cx: &App) {
-    let draft = DraftData {
-        to: window.to.read(cx).content().to_string(),
-        cc: window.cc.read(cx).content().to_string(),
-        subject: window.subject.read(cx).content().to_string(),
-        body: window.body.read(cx).content().to_string(),
-    };
-    let _ = draft_store::save(&draft_key(&window.kind), &draft);
+fn current_draft(window: &ComposeWindow, cx: &App) -> DraftData {
+    DraftData {
+        to: window.to.read(cx).value().to_string(),
+        cc: window.cc.read(cx).value().to_string(),
+        subject: window.subject.read(cx).value().to_string(),
+        body: window.body.read(cx).value().to_string(),
+    }
+}
+
+fn persist_draft(window: &ComposeWindow, cx: &App) -> Result<(), String> {
+    draft_store::save(&draft_key(&window.kind), &current_draft(window, cx))
+        .map_err(|error| error.to_string())
+}
+
+fn clear_sent_draft(key: &str, snapshot: &DraftData) -> Result<bool, String> {
+    match draft_store::load(key).map_err(|error| error.to_string())? {
+        Some(stored) if stored != *snapshot => Ok(false),
+        Some(_) => draft_store::remove(key)
+            .map(|_| true)
+            .map_err(|error| error.to_string()),
+        None => Ok(true),
+    }
 }
 
 fn compose_title(kind: &ComposeKind) -> &'static str {
@@ -447,20 +622,30 @@ fn html_to_plain_text(value: &str) -> String {
     output.trim().to_string()
 }
 
-fn subscribe_input(
+fn input_is_composing<T: EntityInputHandler>(
+    input: &Entity<T>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    input.update(cx, |state, cx| {
+        state.marked_text_range(window, cx).is_some()
+    })
+}
+
+fn subscribe_input<T: EventEmitter<InputEvent>>(
     cx: &mut Context<ComposeWindow>,
-    input: &Entity<ComposerInput>,
+    input: &Entity<T>,
 ) -> gpui::Subscription {
     cx.subscribe(
         input,
-        |this: &mut ComposeWindow, _input, event: &ComposerEvent, cx| match event {
-            ComposerEvent::Submit => this.attempt_send(cx),
-            ComposerEvent::Cancel => this.close(cx),
-            ComposerEvent::Edited => {
-                persist_draft(this, cx);
-                cx.notify();
+        |this: &mut ComposeWindow, _input, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                this.save_current_draft(cx);
             }
-            ComposerEvent::NavigatePrevious | ComposerEvent::NavigateNext => {}
+            // PressEnter is emitted for ordinary Textarea newlines too. It is
+            // not the old Submit event: sending goes through SendCompose or
+            // the button, both guarded against an active IME composition.
+            InputEvent::PressEnter { .. } | InputEvent::Focus | InputEvent::Blur => {}
         },
     )
 }
@@ -505,6 +690,103 @@ fn send_email(to: &str, cc: &str, subject: &str, body: &str) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn composer_input_keymap(include_override: bool) -> gpui::Keymap {
+        use gpui_kit::component::input::Enter;
+        let mut bindings = vec![
+            KeyBinding::new(
+                "enter",
+                Enter {
+                    secondary: false,
+                    shift: false,
+                },
+                Some("Input"),
+            ),
+            KeyBinding::new(
+                "shift-enter",
+                Enter {
+                    secondary: false,
+                    shift: true,
+                },
+                Some("Input"),
+            ),
+            KeyBinding::new(
+                "secondary-enter",
+                Enter {
+                    secondary: true,
+                    shift: false,
+                },
+                Some("Input"),
+            ),
+            KeyBinding::new("ctrl-enter", SendCompose, Some("Compose")),
+        ];
+        if include_override {
+            bindings.push(input_send_binding());
+        }
+        gpui::Keymap::new(bindings)
+    }
+
+    fn input_context(parent: &str) -> [gpui::KeyContext; 2] {
+        [
+            gpui::KeyContext::parse(parent).unwrap(),
+            gpui::KeyContext::parse("Input").unwrap(),
+        ]
+    }
+
+    #[test]
+    fn secondary_enter_is_the_platform_modifier_not_a_distinct_key() {
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
+        assert_eq!(
+            gpui::Keystroke::parse("secondary-enter").unwrap(),
+            gpui::Keystroke::parse(modifier).unwrap()
+        );
+    }
+
+    #[test]
+    fn composer_send_precedes_library_enter_without_inserting_a_newline() {
+        let input = [gpui::Keystroke::parse("secondary-enter").unwrap()];
+        let context = input_context("Compose");
+        let (old_bindings, _) = composer_input_keymap(false).bindings_for_input(&input, &context);
+        assert!(old_bindings[0]
+            .action()
+            .as_any()
+            .is::<gpui_kit::component::input::Enter>());
+        let (bindings, pending) = composer_input_keymap(true).bindings_for_input(&input, &context);
+        assert!(!pending);
+        assert!(bindings[0].action().as_any().is::<SendCompose>());
+    }
+
+    #[test]
+    fn plain_and_shift_enter_do_not_send_a_message() {
+        let keymap = composer_input_keymap(true);
+        for key in ["enter", "shift-enter"] {
+            let input = [gpui::Keystroke::parse(key).unwrap()];
+            let (bindings, pending) = keymap.bindings_for_input(&input, &input_context("Compose"));
+            assert!(!pending);
+            assert!(!bindings.is_empty());
+            assert!(bindings
+                .iter()
+                .all(|binding| !binding.action().as_any().is::<SendCompose>()));
+        }
+    }
+
+    #[test]
+    fn compose_override_does_not_capture_other_windows_inputs() {
+        let input = [gpui::Keystroke::parse("secondary-enter").unwrap()];
+        let (bindings, _) =
+            composer_input_keymap(true).bindings_for_input(&input, &input_context("MailApp"));
+        assert!(bindings[0]
+            .action()
+            .as_any()
+            .is::<gpui_kit::component::input::Enter>());
+        assert!(bindings
+            .iter()
+            .all(|binding| !binding.action().as_any().is::<SendCompose>()));
+    }
 
     #[test]
     fn smtp_config_matches_poc() {

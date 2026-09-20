@@ -92,6 +92,16 @@ pub fn log_index_problem(
     )
 }
 
+/// Preserve non-index I/O failures without logging paths, message contents or
+/// credentials from the error's Display string.
+pub fn log_operation_error(
+    log: &Path,
+    event: &str,
+    error: &(dyn Error + 'static),
+) -> io::Result<()> {
+    append(log, "ERROR", event, &error_fingerprint(error))
+}
+
 fn error_fingerprint(error: &(dyn Error + 'static)) -> String {
     let mut current = Some(error);
     while let Some(error) = current {

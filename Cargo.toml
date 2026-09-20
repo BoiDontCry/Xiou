@@ -24,12 +24,22 @@ name = "import-eml"
 path = "src/import_eml.rs"
 
 [[bin]]
-name = "foxmail-rs"
+name = "xiou"
 path = "src/main.rs"
 
 [[bin]]
 name = "smtp-send"
 path = "src/smtp_send.rs"
+
+# Opt-in native regressions; keep plain cargo test usable without a desktop/GPU.
+[[test]]
+name = "gpui-migration"
+path = "tests/gpui_migration.rs"
+harness = false
+required-features = ["native-ui-tests"]
+
+[features]
+native-ui-tests = ["gpui-kit/test-support"]
 
 [dependencies]
 imap = "3.0.0-alpha.15"
@@ -46,9 +56,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_System_Console",
     "Win32_System_Registry",
+    "Win32_System_Threading",
 ] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 raw-window-handle = "0.6"
+# header-only dimension reads for inline CID images (already in graph via gpui-pre)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -57,8 +70,10 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 tray-icon = { version = "0.24", default-features = false }
-gpui = { git = "https://github.com/egoist/zed", branch = "waku-webview" }
-gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview", features = ["font-kit"] }
+# T1 swap: git gpui retired; gpui-pre 0.3.x renamed to gpui/gpui_platform for import compat
+gpui = { package = "gpui-pre", version = "0.3.4", features = ["font-kit"] }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.4", features = ["font-kit"] }
+gpui-kit = "0.6"
 
 [profile.release]
 lto = "thin"
