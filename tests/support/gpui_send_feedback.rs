@@ -109,6 +109,31 @@ fn edit_send_body(fixture: &SendFixture, cx: &mut AsyncApp, value: &str) {
     });
 }
 
+/// 隔离 profile 里的临时离线账号：请求冻结检查用，收件人恒在 .invalid 域，
+/// 发送只走本地 Task，永不建立 SMTP 连接。同步路径的“无可用账号”检查依赖
+/// 该文件在用后即删。
+fn seed_offline_account() {
+    use foxmail_imap::account_config::{ImapConfig, SmtpConfig, SmtpSecurity};
+    let seeded = account_config::AccountConfig {
+        schema_version: account_config::SCHEMA_VERSION,
+        incoming: ImapConfig {
+            host: "imap.example.invalid".into(),
+            port: 993,
+            user: "sender@example.invalid".into(),
+            password: "isolated-test-password".into(),
+        },
+        outgoing: Some(SmtpConfig {
+            host: "smtp.example.invalid".into(),
+            port: 465,
+            security: SmtpSecurity::ImplicitTls,
+            auth_user: "sender@example.invalid".into(),
+            password: "isolated-test-password".into(),
+            from_address: "sender@example.invalid".into(),
+        }),
+    };
+    account_config::save(&seeded).expect("seed isolated account config");
+}
+
 fn begin_local_send(
     fixture: &SendFixture,
     cx: &mut AsyncApp,
@@ -118,8 +143,10 @@ fn begin_local_send(
     std::sync::mpsc::Sender<Result<String, String>>,
 ) {
     let (sender, receiver) = std::sync::mpsc::channel();
-    let (generation, snapshot) = send_update(fixture, cx, |view, window, cx| {
-        let (generation, snapshot) = view.begin_send(window, cx).expect("valid offline snapshot");
+    seed_offline_account();
+    let result = send_update(fixture, cx, |view, window, cx| {
+        let (generation, _request, snapshot) =
+            view.begin_send(window, cx).expect("valid offline snapshot");
         let task = cx.background_executor().spawn(async move {
             receiver
                 .recv()
@@ -128,7 +155,10 @@ fn begin_local_send(
         view.dispatch_send(generation, snapshot.clone(), task, cx);
         (generation, snapshot)
     });
-    (generation, snapshot, sender)
+    if let Ok(path) = account_config::config_path() {
+        std::fs::remove_file(path).ok();
+    }
+    (result.0, result.1, sender)
 }
 
 async fn wait_send_terminal(fixture: &SendFixture, cx: &mut AsyncApp) {

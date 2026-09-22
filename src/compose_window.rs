@@ -2,8 +2,9 @@ use crate::draft_store::{self, DraftData};
 use crate::feedback::{self, Feedback, NoticeKind, NoticeLevel};
 use crate::theme::Theme;
 use crate::ui::{control_button, rems, ButtonKind};
-use foxmail_imap::credentials;
+use foxmail_imap::account_config::{self, SmtpConfig};
 use foxmail_imap::mail_store::MessageDetail;
+use foxmail_imap::smtp::{self, SendRequest};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     actions, div, px, size, App, AppContext, Bounds, Context, Entity, EntityInputHandler,
@@ -12,13 +13,6 @@ use gpui::{
 };
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use lettre::message::Mailbox;
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Message, SmtpTransport, Transport};
-
-pub const SMTP_HOST: &str = "smtp.yunyou.top";
-pub const SMTP_PORT: u16 = 465;
-pub const FROM_ADDR: &str = "zhangwei@szshuori.com";
 
 actions!(compose, [CloseCompose, SendCompose]);
 
@@ -56,7 +50,8 @@ enum SendState {
     Idle,
     Sending {
         generation: u64,
-        snapshot: DraftData,
+        request: Box<SendRequest>,
+        draft_snapshot: DraftData,
     },
     Success {
         detail: String,
@@ -72,6 +67,8 @@ pub struct ComposeWindow {
     cc: Entity<InputState>,
     subject: Entity<InputState>,
     body: Entity<TextareaState>,
+    /// 窗口打开时刻的发件配置快照，用于只读展示；发送身份以点击发送时刻重新加载的配置为准。
+    outgoing_display: Option<SmtpConfig>,
     send_state: SendState,
     send_generation: u64,
     draft_error: Option<SharedString>,
@@ -82,6 +79,10 @@ pub struct ComposeWindow {
 impl ComposeWindow {
     fn new(kind: ComposeKind, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (to_initial, cc_initial, subject_initial, body_initial) = draft_fields(&kind);
+        let outgoing_display = account_config::load()
+            .ok()
+            .flatten()
+            .and_then(|account| account.outgoing);
 
         let to = cx.new(|cx| InputState::new(window, cx).placeholder("输入收件人地址"));
         to.update(cx, |state, cx| state.set_value(to_initial, window, cx));
@@ -105,6 +106,7 @@ impl ComposeWindow {
             cc,
             subject,
             body,
+            outgoing_display,
             send_state: SendState::Idle,
             send_generation: 0,
             draft_error: None,
@@ -141,17 +143,13 @@ impl ComposeWindow {
     }
 
     fn attempt_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((generation, snapshot)) = self.begin_send(window, cx) else {
+        let Some((generation, request, snapshot)) = self.begin_send(window, cx) else {
             return;
         };
-        let request = snapshot.clone();
         let task = cx.background_executor().spawn(async move {
-            send_email(
-                request.to.trim(),
-                request.cc.trim(),
-                request.subject.trim(),
-                &request.body,
-            )
+            smtp::send(&request)
+                .map(|receipt| format!("code={}", receipt.code))
+                .map_err(|error| error.message())
         });
         self.dispatch_send(generation, snapshot, task, cx);
     }
@@ -160,7 +158,7 @@ impl ComposeWindow {
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(u64, DraftData)> {
+    ) -> Option<(u64, SendRequest, DraftData)> {
         if matches!(self.send_state, SendState::Sending { .. })
             || input_is_composing(&self.to, window, cx)
             || input_is_composing(&self.cc, window, cx)
@@ -178,15 +176,46 @@ impl ComposeWindow {
             self.reject_send("正文不能为空", cx);
             return None;
         }
+        // 点击发送时刻的账号快照：加载、验证并冻结为不可变请求。
+        // 此后发生的设置变化不影响本次发送。
+        let account = match account_config::load() {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                self.reject_send("未保存邮箱账号，请先配置账号", cx);
+                return None;
+            }
+            Err(error) => {
+                self.reject_send(&format!("读取账号配置失败：{error}"), cx);
+                return None;
+            }
+        };
+        if let Err(error) = account.validate() {
+            self.reject_send(&error, cx);
+            return None;
+        }
+        let request = match SendRequest::build(
+            account.outgoing,
+            &snapshot.to,
+            &snapshot.cc,
+            snapshot.subject.trim(),
+            &snapshot.body,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.reject_send(&error.message(), cx);
+                return None;
+            }
+        };
         self.save_current_draft(cx);
         self.send_generation = self.send_generation.wrapping_add(1);
         let generation = self.send_generation;
         self.send_state = SendState::Sending {
             generation,
-            snapshot: snapshot.clone(),
+            request: Box::new(request.clone()),
+            draft_snapshot: snapshot.clone(),
         };
         cx.notify();
-        Some((generation, snapshot))
+        Some((generation, request, snapshot))
     }
 
     fn reject_send(&mut self, error: &str, cx: &mut Context<Self>) {
@@ -235,7 +264,8 @@ impl ComposeWindow {
     ) {
         let SendState::Sending {
             generation: active,
-            snapshot,
+            draft_snapshot: snapshot,
+            ..
         } = &self.send_state
         else {
             return;
@@ -312,9 +342,12 @@ impl ComposeWindow {
     fn render_send_status(&self) -> Option<gpui::AnyElement> {
         let (level, message, busy) = match &self.send_state {
             SendState::Idle => return None,
-            SendState::Sending { .. } => (
+            SendState::Sending { request, .. } => (
                 NoticeLevel::Info,
-                "正在发送，等待服务器确认…".to_owned(),
+                format!(
+                    "正在以 {} 发送，等待服务器确认…（发送身份已在点击时冻结）",
+                    request.account.from_address
+                ),
                 true,
             ),
             SendState::Success { detail, warning } => (
@@ -387,6 +420,39 @@ impl ComposeWindow {
             )
     }
 
+    fn render_sender_row(&self, theme: Theme) -> impl IntoElement {
+        let sender: SharedString = match &self.outgoing_display {
+            Some(smtp) => smtp.from_address.clone().into(),
+            None => "未配置发件账号（仅可收信）".into(),
+        };
+        div()
+            .h(rems(2.25))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.raised)
+            .child(
+                div()
+                    .w(rems(3.5))
+                    .flex_shrink_0()
+                    .text_color(theme.text_tertiary)
+                    .text_xs()
+                    .child("发件人"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.text_secondary)
+                    .text_xs()
+                    .child(sender),
+            )
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let sending = matches!(self.send_state, SendState::Sending { .. });
@@ -440,6 +506,7 @@ impl Render for ComposeWindow {
             .flex_col()
             .child(self.render_toolbar(cx))
             .children(self.render_send_status())
+            .child(self.render_sender_row(theme))
             .when_some(self.draft_error.clone(), |view, error| {
                 view.child(
                     div()
@@ -650,43 +717,6 @@ fn subscribe_input<T: EventEmitter<InputEvent>>(
     )
 }
 
-fn send_email(to: &str, cc: &str, subject: &str, body: &str) -> Result<String, String> {
-    let password = credentials::load_or_initialize(false).map_err(|e| e.to_string())?;
-    let from: Mailbox = FROM_ADDR
-        .parse()
-        .map_err(|e| format!("发件人地址无效：{e}"))?;
-    let to_mailbox: Mailbox = to.parse().map_err(|e| format!("收件人地址无效：{e}"))?;
-    let cc_mailboxes: Result<Vec<Mailbox>, _> = cc
-        .split(',')
-        .map(str::trim)
-        .filter(|address| !address.is_empty())
-        .map(str::parse)
-        .collect();
-    let cc_mailboxes = cc_mailboxes.map_err(|e| format!("抄送地址无效：{e}"))?;
-    let mut builder = Message::builder()
-        .from(from)
-        .to(to_mailbox)
-        .subject(subject);
-    for mailbox in cc_mailboxes {
-        builder = builder.cc(mailbox);
-    }
-    let email = builder
-        .body(body.to_string())
-        .map_err(|e| format!("构造邮件失败：{e}"))?;
-    let transport = SmtpTransport::relay(SMTP_HOST)
-        .map_err(|e| format!("SMTP 连接配置失败：{e}"))?
-        .port(SMTP_PORT)
-        .credentials(Credentials::new(
-            FROM_ADDR.to_string(),
-            password.as_str().to_string(),
-        ))
-        .build();
-    match transport.send(&email) {
-        Ok(response) => Ok(format!("code={}", response.code())),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,13 +819,6 @@ mod tests {
     }
 
     #[test]
-    fn smtp_config_matches_poc() {
-        assert_eq!(SMTP_HOST, "smtp.yunyou.top");
-        assert_eq!(SMTP_PORT, 465);
-        assert_eq!(FROM_ADDR, "zhangwei@szshuori.com");
-    }
-
-    #[test]
     fn initial_fields_are_blank_for_new_message() {
         let (to, subject, body) = initial_fields(&ComposeKind::New);
         assert!(to.is_empty());
@@ -805,13 +828,30 @@ mod tests {
 
     #[test]
     fn rejects_invalid_cc_addresses_before_smtp_connection() {
-        let cc_mailboxes: Result<Vec<Mailbox>, _> = "valid@example.com, invalid"
-            .split(',')
-            .map(str::trim)
-            .filter(|address| !address.is_empty())
-            .map(str::parse)
-            .collect();
-        assert!(cc_mailboxes.is_err());
+        let request = SendRequest::build(
+            None,
+            "valid@example.com",
+            "valid@example.com, invalid",
+            "主题",
+            "正文",
+        );
+        // SMTP 未配置也先报未配置；地址校验在配置存在时先行于任何网络动作。
+        assert!(request.is_err());
+        let request = SendRequest::build(
+            Some(foxmail_imap::account_config::SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 465,
+                security: foxmail_imap::account_config::SmtpSecurity::ImplicitTls,
+                auth_user: "user@example.com".into(),
+                password: "secret".into(),
+                from_address: "user@example.com".into(),
+            }),
+            "valid@example.com",
+            "valid@example.com, invalid",
+            "主题",
+            "正文",
+        );
+        assert_eq!(request.unwrap_err().category(), "invalid-recipient");
     }
 
     #[test]

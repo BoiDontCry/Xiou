@@ -7,12 +7,15 @@ Foxmail Reader 是 Rust / GPUI 实现的 Windows x64 邮件客户端。
 写信/回复/转发/草稿、附件保存与图片预览，以及深浅/自定义主题。
 **配置账号后，程序会连接服务器并在启动及定时任务中同步邮件，不再是纯只读工具。**
 
-发送链路仍使用开发期固定 SMTP/发件配置，尚非完整通用多账号发送功能。
-不要因为 IMAP 账号配置成功，就假定发送身份也随之切换。真实收发需另行验收。
+发送已统一到单账号模型：账号配置（首启引导页）可同时填写 IMAP 收信与
+可选 SMTP 发信，发件身份在点击发送时从账号配置冻结快照中取得；SMTP 可选，
+未配置时仍可收信，但写信窗口会提示无法发送。密码以 DPAPI 加密落盘，
+日志与错误提示不含密码或完整地址列表。真实账号的发送/接收仍需按验收计划
+另行人工验收，不要把自动测试通过当作真实账号可用承诺。
 
 ## 启动
 
-双击 `foxmail-rs.exe`。程序按以下顺序查找索引：
+双击 `xiou.exe`。程序按以下顺序查找索引：
 
 1. `FOXMAIL_INDEX_PATH` 指定的 SQLite 文件。
 2. `FOXMAIL_BACKUP_DIR` 目录下的 `mail-index.sqlite`。
@@ -20,7 +23,7 @@ Foxmail Reader 是 Rust / GPUI 实现的 Windows x64 邮件客户端。
 4. `%LOCALAPPDATA%\foxmail-rs\data\mail-index.sqlite`。
 
 普通使用时，将索引放到 `%LOCALAPPDATA%\foxmail-rs\data`。便携使用时，在
-`foxmail-rs.exe` 同目录创建 `data` 文件夹并放入索引。环境变量的优先级高于
+`xiou.exe` 同目录创建 `data` 文件夹并放入索引。环境变量的优先级高于
 便携目录；切换模式前请检查是否保留了旧环境变量。
 
 ## 日志
@@ -44,7 +47,7 @@ Foxmail Reader 是 Rust / GPUI 实现的 Windows x64 邮件客户端。
 在 ZIP 所在目录运行：
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\foxmail-rs-*-windows-x64.zip
+Get-FileHash -Algorithm SHA256 .\xiou-*-windows-x64.zip
 ```
 
 结果应与同目录 `.sha256` 文件一致。ZIP 内的 `SHA256SUMS.txt` 用于校验 EXE。
@@ -63,6 +66,6 @@ Get-FileHash -Algorithm SHA256 .\foxmail-rs-*-windows-x64.zip
 
 - GPUI Kit 迁移已有实现、离线自动回归及一批离屏截图审阅，但还未完成完整交付验收。
 - 真实 Windows 输入法、托盘/焦点、多 DPI、代表性大图片/附件与完整 release 性能仍待验收。
-- SMTP 配置仍有上述 PoC 限制；没有安装器和自动更新。不得把自动测试通过当成真实账号可用承诺。
+- SMTP 发送走单账号配置（阶段二）；没有安装器和自动更新。不得把自动测试通过当成真实账号可用承诺。
 - 新开发版与桌面快捷方式指向的旧 release 可能不同。升级前先核对 EXE 路径及生成时间。
 - 当前进度与剩余验收项见 `docs/GPUI-MIGRATION.md`。

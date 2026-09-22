@@ -16,7 +16,6 @@ fn parse_options() -> Result<BackupOptions, Box<dyn std::error::Error>> {
     let mut max_messages = None;
     let mut chunk_size = foxmail_imap::backup::DEFAULT_CHUNK_SIZE;
     let mut dry_run = false;
-    let mut reset_password = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,19 +34,12 @@ fn parse_options() -> Result<BackupOptions, Box<dyn std::error::Error>> {
                 chunk_size = value * 1024 * 1024;
             }
             "--dry-run" => dry_run = true,
-            "--reset-password" => reset_password = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
             }
             _ => return Err(format!("未知参数：{arg}，使用 --help 查看帮助").into()),
         }
-    }
-
-    if reset_password {
-        // --reset-password 需要在 run_backup 内部触发凭据重置；当前 lib 接口用 load_or_initialize(false)。
-        // 保留 CLI 行为：先强制重置密码，再跑备份。
-        foxmail_imap::credentials::load_or_initialize(true)?;
     }
 
     Ok(BackupOptions {
@@ -67,7 +59,6 @@ fn print_help() {
          --mailbox <名称>       仅备份指定文件夹\n\
          --max-messages <数量>  每个文件夹仅处理最新 N 封\n\
          --chunk-mib <数量>     分块大小 MiB，默认 4，范围 1..=64\n\
-         --dry-run              只列 UID 和大小，不下载正文\n\
-         --reset-password       重新输入并用 DPAPI 保存密码\n"
+         --dry-run              只列 UID 和大小，不下载正文\n"
     )
 }

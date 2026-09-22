@@ -1,7 +1,7 @@
 use crate::html;
 use crate::imap_utf7;
-use crate::search_query::{self, ParsedQuery};
 use crate::mime_plan::{AttachmentSidecar, DeferredAttachment};
+use crate::search_query::{self, ParsedQuery};
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,11 @@ END;
 "#;
 
 pub type StoreResult<T> = Result<T, Box<dyn Error>>;
+
+/// 邮件详情与同批内嵌资源（带 Content-ID 的载荷）。
+pub type MessageAssets = (MessageDetail, HashMap<String, Vec<u8>>);
+/// 附件元数据与同批内嵌资源载荷。
+pub type AttachmentAssets = (Vec<AttachmentMeta>, HashMap<String, Vec<u8>>);
 
 pub enum AttachmentPayload {
     Bytes(Vec<u8>),
@@ -492,8 +497,7 @@ impl MailStore {
             .take(limit as usize)
             .map(|(id, _)| *id)
             .collect();
-        let order: HashMap<i64, usize> =
-            top.iter().enumerate().map(|(ix, id)| (*id, ix)).collect();
+        let order: HashMap<i64, usize> = top.iter().enumerate().map(|(ix, id)| (*id, ix)).collect();
 
         let id_list = id_in_list(top.iter().copied());
         let sql = format!(
@@ -537,7 +541,11 @@ impl MailStore {
         }
 
         if !q.fts.is_empty() {
-            let match_ids = top.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            let match_ids = top
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let sql = format!(
                 "SELECT rowid, snippet(message_fts, 3, '[', ']', '…', 24)
                  FROM message_fts
@@ -682,11 +690,17 @@ impl MailStore {
     /// Return the position in the same stable order as message_page without
     /// loading every preceding row. NULL dates sort after dated messages.
     pub fn message_position(&self, mailbox_id: i64, message_id: i64) -> StoreResult<Option<usize>> {
-        let target: Option<(Option<i64>, u32)> = self.connection.query_row(
-            "SELECT date_unix, uid FROM message WHERE mailbox_id = ?1 AND id = ?2",
-            params![mailbox_id,message_id], |row| Ok((row.get(0)?,row.get(1)?)),
-        ).optional()?;
-        let Some((date,uid))=target else { return Ok(None); };
+        let target: Option<(Option<i64>, u32)> = self
+            .connection
+            .query_row(
+                "SELECT date_unix, uid FROM message WHERE mailbox_id = ?1 AND id = ?2",
+                params![mailbox_id, message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((date, uid)) = target else {
+            return Ok(None);
+        };
         let position: i64=self.connection.query_row(
             "SELECT COUNT(*) FROM message WHERE mailbox_id = ?1 AND
              ((?2 IS NULL AND date_unix IS NOT NULL) OR date_unix > ?2 OR (date_unix IS ?2 AND uid > ?3))",
@@ -773,17 +787,17 @@ impl MailStore {
     pub fn message_detail_with_assets(
         &self,
         message_id: i64,
-    ) -> StoreResult<Option<(MessageDetail, HashMap<String, Vec<u8>>)>> {
+    ) -> StoreResult<Option<MessageAssets>> {
         let Some(row) = self.message_row(message_id)? else {
             return Ok(None);
         };
 
         let attachment_path = self.resolve_source_path(&row.eml_path);
-        let (attachments, cid_payloads, attachment_load_error) = match read_eml_assets(&attachment_path)
-        {
-            Ok((attachments, cid_payloads)) => (attachments, cid_payloads, None),
-            Err(error) => (Vec::new(), HashMap::new(), Some(error.to_string())),
-        };
+        let (attachments, cid_payloads, attachment_load_error) =
+            match read_eml_assets(&attachment_path) {
+                Ok((attachments, cid_payloads)) => (attachments, cid_payloads, None),
+                Err(error) => (Vec::new(), HashMap::new(), Some(error.to_string())),
+            };
 
         let detail = Self::detail_from_row(row, attachments, attachment_load_error);
         Ok(Some((detail, cid_payloads)))
@@ -973,7 +987,7 @@ fn read_attachment_metadata(path: &Path) -> StoreResult<Vec<AttachmentMeta>> {
 }
 
 /// 一次读取 + 解析 `.eml`，同时返回附件元数据与全部带 Content-ID 的载荷。
-fn read_eml_assets(path: &Path) -> StoreResult<(Vec<AttachmentMeta>, HashMap<String, Vec<u8>>)> {
+fn read_eml_assets(path: &Path) -> StoreResult<AttachmentAssets> {
     let raw = fs::read(path)?;
     let message = MessageParser::default()
         .parse(&raw)
@@ -1565,7 +1579,8 @@ pub fn sanitized_attachment_filename(filename: &str) -> String {
         .trim()
         .chars()
         .filter(|character| {
-            !character.is_control() && !matches!(*character, ':' | '"' | '<' | '>' | '|' | '?' | '*')
+            !character.is_control()
+                && !matches!(*character, ':' | '"' | '<' | '>' | '|' | '?' | '*')
         })
         .collect::<String>()
         .trim()
@@ -1825,9 +1840,8 @@ Content-Transfer-Encoding: 8bit\r\n\
         let mut store = MailStore::open(&database).unwrap();
         store.import_backup(&root).unwrap();
 
-        let uids = |hits: Vec<SearchHit>| -> Vec<u32> {
-            hits.into_iter().map(|hit| hit.uid).collect()
-        };
+        let uids =
+            |hits: Vec<SearchHit>| -> Vec<u32> { hits.into_iter().map(|hit| hit.uid).collect() };
 
         // AND：两术语同时命中的才保留。
         let hits = store.search("q3budget meeting", 10).unwrap();
@@ -1866,7 +1880,10 @@ Content-Transfer-Encoding: 8bit\r\n\
         assert!(store.search("from:nobody q3budget", 10).unwrap().is_empty());
 
         // has:attachment：夹具没有附件。
-        assert!(store.search("has:attachment q3budget", 10).unwrap().is_empty());
+        assert!(store
+            .search("has:attachment q3budget", 10)
+            .unwrap()
+            .is_empty());
 
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -2116,7 +2133,10 @@ AAE=\r\n\
             let input = format!("报告{invalid}最终版.txt");
             assert_eq!(sanitized_attachment_filename(&input), "报告最终版.txt");
         }
-        assert_eq!(sanitized_attachment_filename("../../unsafe?.bin"), "unsafe.bin");
+        assert_eq!(
+            sanitized_attachment_filename("../../unsafe?.bin"),
+            "unsafe.bin"
+        );
         assert_eq!(sanitized_attachment_filename("<>|?*"), "attachment.bin");
     }
 
@@ -2126,7 +2146,10 @@ AAE=\r\n\
             assert_eq!(sanitized_attachment_filename(input), "attachment.bin");
         }
         assert_eq!(sanitized_attachment_filename("COM10.txt"), "COM10.txt");
-        assert_eq!(sanitized_attachment_filename("正常报告🙂.txt"), "正常报告🙂.txt");
+        assert_eq!(
+            sanitized_attachment_filename("正常报告🙂.txt"),
+            "正常报告🙂.txt"
+        );
     }
 
     #[test]

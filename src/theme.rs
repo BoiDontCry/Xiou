@@ -24,6 +24,8 @@ pub struct Theme {
 }
 
 impl Theme {
+    // 仅供 native 迁移测试通过 lib 依赖调用。
+    #[allow(dead_code)]
     pub fn dark() -> Self {
         Self {
             canvas: rgb(0x191919).into(),
@@ -47,6 +49,7 @@ impl Theme {
         }
     }
 
+    #[allow(dead_code)]
     pub fn light() -> Self {
         Self {
             canvas: rgb(0xF4F4F4).into(),

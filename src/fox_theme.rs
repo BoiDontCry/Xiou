@@ -11,9 +11,9 @@ use gpui_kit::component::theme::{Theme as KitTheme, ThemeColor, ThemeMode, Theme
 /// testable without a gpui App.
 fn fox_color(theme: Theme) -> ThemeColor {
     let mut colors = if theme.canvas.l > 0.5 {
-        ThemeColor::light().as_ref().clone()
+        *ThemeColor::light().as_ref()
     } else {
-        ThemeColor::dark().as_ref().clone()
+        *ThemeColor::dark().as_ref()
     };
     colors.background = theme.canvas;
     colors.foreground = theme.text;

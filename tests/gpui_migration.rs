@@ -796,12 +796,35 @@ fn check_themes(cx: &mut App) -> Vec<Value> {
             let base = gpui_kit::base::Theme::global(cx);
             assert_eq!(kit.primary, theme.accent, "{name}: Kit primary");
             assert_eq!(kit.button_primary, theme.accent, "{name}: Kit button");
-            assert_eq!(kit.tokens.button_primary.color, theme.accent, "{name}: resolved Button color");
-            assert_eq!(kit.tokens.button_primary.background, theme.accent.into(), "{name}: rendered Button fill");
-            assert_eq!(kit.tokens.popover.background, theme.raised.into(), "{name}: rendered Dialog fill");
-            assert_eq!(kit.tokens.list_active.background, theme.active.into(), "{name}: rendered List selection");
-            assert_eq!(kit.tokens.progress_bar.background, theme.accent.into(), "{name}: rendered Progress fill");
-            assert_eq!(kit.tokens.slider_bar.background, theme.accent.into(), "{name}: rendered Slider fill");
+            assert_eq!(
+                kit.tokens.button_primary.color, theme.accent,
+                "{name}: resolved Button color"
+            );
+            assert_eq!(
+                kit.tokens.button_primary.background,
+                theme.accent.into(),
+                "{name}: rendered Button fill"
+            );
+            assert_eq!(
+                kit.tokens.popover.background,
+                theme.raised.into(),
+                "{name}: rendered Dialog fill"
+            );
+            assert_eq!(
+                kit.tokens.list_active.background,
+                theme.active.into(),
+                "{name}: rendered List selection"
+            );
+            assert_eq!(
+                kit.tokens.progress_bar.background,
+                theme.accent.into(),
+                "{name}: rendered Progress fill"
+            );
+            assert_eq!(
+                kit.tokens.slider_bar.background,
+                theme.accent.into(),
+                "{name}: rendered Slider fill"
+            );
             assert_eq!(
                 base.tokens.colors.primary, theme.accent,
                 "{name}: Base primary"
@@ -862,10 +885,19 @@ fn main() {
         return;
     }
     let args: Vec<_> = std::env::args().collect();
-    assert!(args.last().map(String::as_str) != Some("--suite"), "--suite needs all, E6, E7 or E8");
-    let suite = args.windows(2).find(|pair| pair[0] == "--suite")
-        .map(|pair| pair[1].clone()).unwrap_or_else(|| "all".into());
-    assert!(matches!(suite.as_str(), "all" | "E6" | "E7" | "E8"), "unknown native suite: {suite}");
+    assert!(
+        args.last().map(String::as_str) != Some("--suite"),
+        "--suite needs all, E6, E7 or E8"
+    );
+    let suite = args
+        .windows(2)
+        .find(|pair| pair[0] == "--suite")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| "all".into());
+    assert!(
+        matches!(suite.as_str(), "all" | "E6" | "E7" | "E8"),
+        "unknown native suite: {suite}"
+    );
     let profile = isolated_profile();
     let complete = Rc::new(Cell::new(false));
     let completed = complete.clone();

@@ -1,23 +1,24 @@
+use foxmail_imap::account_config;
 use foxmail_imap::backup;
-use foxmail_imap::credentials;
-use foxmail_imap::imap_config::{HOST, PORT, USER};
 use foxmail_imap::imap_errors::login_error;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let reset_password = std::env::args().any(|arg| arg == "--reset-password");
-    let password = credentials::load_or_initialize(reset_password)?;
+    let account = account_config::load()
+        .map_err(|error| format!("读取账号配置失败：{error}"))?
+        .ok_or("未找到邮箱账号配置，请先在 xiou 中配置账号")?;
+    let incoming = &account.incoming;
 
     println!(
         "[M0] IMAP PoC: 连接 {}:{}，启用严格 TLS 校验 ...",
-        HOST, PORT
+        incoming.host, incoming.port
     );
-    let client = backup::connect(HOST, PORT)?;
+    let client = backup::connect(&incoming.host, incoming.port)?;
     println!("[M0] TLS 握手及证书校验成功");
 
     let mut session = client
-        .login(USER, password.as_str())
+        .login(&incoming.user, &incoming.password)
         .map_err(|(error, _client)| login_error(error))?;
-    println!("[M0] LOGIN 成功: {}", USER);
+    println!("[M0] LOGIN 成功");
 
     let inbox = session.examine("INBOX")?;
     println!(

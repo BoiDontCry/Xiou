@@ -4,7 +4,7 @@ pub fn sanitize_html(html: &str) -> String {
     let mut builder = ammonia::Builder::default();
     builder.add_url_schemes(["cid", "data"]);
     builder.attribute_filter(|element, attribute, value| match (element, attribute) {
-        ("img", "src") => allow_local_image(value).then(|| Cow::Borrowed(value)),
+        ("img", "src") => allow_local_image(value).then_some(Cow::Borrowed(value)),
         _ => Some(Cow::Borrowed(value)),
     });
     builder.clean(html).to_string()
@@ -589,10 +589,11 @@ fn tags_to_plain(value: &str) -> String {
                 }
                 break;
             }
-        } else if VOID_TAGS.contains(&tag.as_str()) || BLOCK_TAGS.contains(&tag.as_str()) {
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
-            }
+        } else if (VOID_TAGS.contains(&tag.as_str()) || BLOCK_TAGS.contains(&tag.as_str()))
+            && !output.is_empty()
+            && !output.ends_with('\n')
+        {
+            output.push('\n');
         }
 
         cursor = end + 1;

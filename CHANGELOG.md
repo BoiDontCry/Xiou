@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+### Unified account model + SMTP send refactor (phase 2) — 2026-09-22 (unreleased)
+
+- New `src/account_config.rs`: versioned (`schema_version = 2`) account model
+  with `incoming: ImapConfig` and optional `outgoing: SmtpConfig`
+  (`SmtpSecurity::{ImplicitTls, StartTls}` replaces the ambiguous `use_tls`
+  bool). Legacy flat configs migrate read-only to receive-only — SMTP hosts
+  are never guessed from mailbox domains. `Debug` impls mask both passwords.
+- New `src/smtp.rs`: single send path shared by the GUI composer and the
+  `smtp-send` tool. `SendRequest::build` freezes the identity/subject/body at
+  click time; failures return a 9-category taxonomy (`NotConfigured`,
+  `InvalidFrom`, `InvalidRecipient`, `Connection`, `Tls`, `Auth(535)`,
+  `ServerRejected`, `Timeout`, `Unknown`) with user messages that never echo
+  credentials.
+- `src/compose_window.rs`: all compile-time identity constants removed
+  (`SMTP_HOST`/`SMTP_PORT`/`FROM_ADDR` gone with `src/imap_config.rs`).
+  `SendState::Sending` carries the frozen `SendRequest` plus a draft
+  snapshot and a generation counter; a read-only sender row shows the
+  configured identity. Without SMTP config the window explicitly says it
+  can only receive.
+- Onboarding UI gains optional SMTP fields (host/port/security/user/
+  password/from) with explicit convenience buttons copying from the IMAP
+  account — no domain-based auto-fill.
+- `smtp-send` requires an explicit recipient argument (no built-in default),
+  and reads SMTP settings from the DPAPI account config or explicit test
+  environment variables only.
+- Settings page gains a “邮箱账号” section with a “重新配置邮箱账号…”
+  entry: it closes the dialog and returns to the pre-filled onboarding page,
+  giving receive-only migrated accounts a path to add SMTP sending.
+  (`-D warnings`), deleted dead `account_monogram`, boxed the
+  `SendState::Sending` variant payload, and re-ran the full gate chain:
+  fmt/check/tests (63 lib + 64 bin), 226 native migration checks, clippy,
+  release build.
+- Repackaged `xiou-0.1.0-windows-x64.zip` (after adding the settings-page
+  account re-entry): two independent package runs
+  produce the identical SHA-256
+  `926f9d6c03d698435f69dc3fca7573da735e53f1456a1794cb3bd12d352ed3b0`
+  (records: `dist/_zip-run-A.txt`, `dist/_zip-run-B.txt`). Privacy rescan of
+  the shipped EXE found no build paths, no real addresses, and no real
+  server domains; isolated auto-exit startup passed with code 0. The
+  package is no longer a test-candidate-only artifact (see `RELEASING.md`).
+
+### Tray icon path de-embed — 2026-09-21 (unreleased)
+
+- `src/tray.rs` `ico_path()` no longer embeds `env!("CARGO_MANIFEST_DIR")`
+  (the build machine's absolute repo path) into the release binary. It now
+  walks up a bounded number of ancestors from the runtime EXE location to
+  find `xiou.ico`, falling back to the EXE-adjacent path; a missing icon
+  still degrades to the iconless tray via the existing `Icon::from_path`
+  error path. Dev runs (`cargo run` from `target/<profile>/`) keep finding
+  the repo-root icon.
+
+### Release chain rename to Xiou — 2026-09-21 (unreleased)
+
+- `scripts/package-release.ps1` now builds `--bin xiou`, stages and ships
+  `xiou.exe`, and names the package `xiou-<version>-windows-x64.zip`
+  (with matching `SHA256SUMS.txt` entry). The Cargo package name
+  `foxmail-imap-poc` and runtime data/log locations under
+  `%LOCALAPPDATA%\foxmail-rs` are unchanged; only the shipped artifact
+  names moved to Xiou. The pinned PowerShell version in the release script
+  was bumped `7.6.3` → `7.6.6` to match the machine actually running the
+  pinned toolchain (Rust/Cargo/MSVC pins unchanged).
+- `RELEASING.md` and `README-使用说明.md` updated to the new EXE and ZIP
+  names; runtime paths documented there still match `src/paths.rs`.
+
 ### GPUI migration E9 closeout — 2026-09-20 (unreleased)
 
 - Removed the last migration remnant: the standalone `spike-gpui-kit` bin

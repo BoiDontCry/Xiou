@@ -45,20 +45,36 @@ enum Role {
 }
 
 pub(crate) fn normalize_plain_body(value: &str) -> String {
-    value.replace("\r\n", "\n").replace('\r', "\n").trim_end().to_owned()
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end()
+        .to_owned()
 }
 
 pub(crate) fn prepare_blocks(html_body: &str, plain_body: &str) -> Vec<MailBodyBlock> {
     let trimmed_html = html_body.trim();
-    let source = if trimmed_html.is_empty() { Vec::new() } else { html::layout_html(trimmed_html) };
+    let source = if trimmed_html.is_empty() {
+        Vec::new()
+    } else {
+        html::layout_html(trimmed_html)
+    };
     if source.is_empty() {
         let plain = normalize_plain_body(plain_body);
-        return text_parts(&plain, Role::Literal, TEXT_CHUNK_BYTES, TEXT_CHUNK_LINES, false);
+        return text_parts(
+            &plain,
+            Role::Literal,
+            TEXT_CHUNK_BYTES,
+            TEXT_CHUNK_LINES,
+            false,
+        );
     }
     let mut out = Vec::new();
     let mut ordinal = 0;
     for block in source {
-        if !matches!(block, BodyBlock::ListItem { ordered: true, .. }) { ordinal = 0; }
+        if !matches!(block, BodyBlock::ListItem { ordered: true, .. }) {
+            ordinal = 0;
+        }
         let (spans, role) = match block {
             BodyBlock::Heading { level, spans } => (spans, Role::Heading(level.clamp(1, 6))),
             BodyBlock::Paragraph { spans } => (spans, Role::Paragraph),
@@ -68,12 +84,26 @@ pub(crate) fn prepare_blocks(html_body: &str, plain_body: &str) -> Vec<MailBodyB
                 (spans, Role::List(ordered.then_some(ordinal)))
             }
             BodyBlock::Pre { text } => {
-                out.extend(text_parts(&text, Role::Code, TEXT_CHUNK_BYTES, TEXT_CHUNK_LINES, false));
+                out.extend(text_parts(
+                    &text,
+                    Role::Code,
+                    TEXT_CHUNK_BYTES,
+                    TEXT_CHUNK_LINES,
+                    false,
+                ));
                 continue;
             }
-            BodyBlock::Table { rows } => { prepare_table(rows, &mut out); continue; }
+            BodyBlock::Table { rows } => {
+                prepare_table(rows, &mut out);
+                continue;
+            }
         };
-        out.extend(inline_parts(spans, role, TEXT_CHUNK_BYTES, TEXT_CHUNK_LINES));
+        out.extend(inline_parts(
+            spans,
+            role,
+            TEXT_CHUNK_BYTES,
+            TEXT_CHUNK_LINES,
+        ));
     }
     if should_merge_html(trimmed_html) {
         merge_adjacent_text_blocks(out)
@@ -112,7 +142,12 @@ fn merge_adjacent_text_blocks(blocks: Vec<MailBodyBlock>) -> Vec<MailBodyBlock> 
     merged
 }
 
-fn inline_parts(spans: Vec<InlineSpan>, role: Role, bytes: usize, lines: usize) -> Vec<MailBodyBlock> {
+fn inline_parts(
+    spans: Vec<InlineSpan>,
+    role: Role,
+    bytes: usize,
+    lines: usize,
+) -> Vec<MailBodyBlock> {
     let mut out = Vec::new();
     let mut text = String::new();
     for span in spans {
@@ -144,7 +179,9 @@ fn chunks(text: &str, bytes: usize, lines: usize) -> Vec<&str> {
         }
         line_count += usize::from(ch == '\n');
     }
-    if start < text.len() { out.push(&text[start..]); }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
     out
 }
 
@@ -152,32 +189,59 @@ fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
-            '&' => out.push_str("&amp;"), '<' => out.push_str("&lt;"), '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"), '\'' => out.push_str("&#39;"), _ => out.push(ch),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
         }
     }
     out
 }
 
-fn text_parts(text: &str, role: Role, bytes: usize, lines: usize, continuation: bool) -> Vec<MailBodyBlock> {
-    chunks(text, bytes, lines).into_iter().enumerate().map(|(index, text)| {
-        let literal = matches!(role, Role::Literal | Role::Code);
-        let value = if literal { escape(text) } else { escape(text).replace('\n', "<br />") };
-        let html = match role {
-            // GPUI 0.3.4 has no white-space: pre-wrap, so <pre> is the only
-            // element that retains whitespace. Wrap code with a soft, mono,
-            // padded background to make long stack traces readable.
-            Role::Literal | Role::Code => format!("<pre{PRE_STYLE}>{value}</pre>"),
-            Role::Heading(level) => format!("<h{level}{HEADING_STYLE}>{value}</h{level}>"),
-            Role::Quote => format!("<blockquote{BLOCKQUOTE_STYLE}><p{PARA_STYLE}>{value}</p></blockquote>"),
-            Role::List(None) if index == 0 && !continuation => format!("<ul><li{PARA_STYLE}>{value}</li></ul>"),
-            // TextView 0.6.1 ignores ol[start]. Explicit ordinals retain the
-            // sequence across virtual chunks instead of restarting every item.
-            Role::List(Some(number)) if index == 0 && !continuation => format!("<p{PARA_STYLE}>{number}. {value}</p>"),
-            _ => format!("<p{PARA_STYLE}>{value}</p>"),
-        };
-        MailBodyBlock::Text { html, monospace: matches!(role, Role::Code) }
-    }).collect()
+fn text_parts(
+    text: &str,
+    role: Role,
+    bytes: usize,
+    lines: usize,
+    continuation: bool,
+) -> Vec<MailBodyBlock> {
+    chunks(text, bytes, lines)
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let literal = matches!(role, Role::Literal | Role::Code);
+            let value = if literal {
+                escape(text)
+            } else {
+                escape(text).replace('\n', "<br />")
+            };
+            let html = match role {
+                // GPUI 0.3.4 has no white-space: pre-wrap, so <pre> is the only
+                // element that retains whitespace. Wrap code with a soft, mono,
+                // padded background to make long stack traces readable.
+                Role::Literal | Role::Code => format!("<pre{PRE_STYLE}>{value}</pre>"),
+                Role::Heading(level) => format!("<h{level}{HEADING_STYLE}>{value}</h{level}>"),
+                Role::Quote => {
+                    format!("<blockquote{BLOCKQUOTE_STYLE}><p{PARA_STYLE}>{value}</p></blockquote>")
+                }
+                Role::List(None) if index == 0 && !continuation => {
+                    format!("<ul><li{PARA_STYLE}>{value}</li></ul>")
+                }
+                // TextView 0.6.1 ignores ol[start]. Explicit ordinals retain the
+                // sequence across virtual chunks instead of restarting every item.
+                Role::List(Some(number)) if index == 0 && !continuation => {
+                    format!("<p{PARA_STYLE}>{number}. {value}</p>")
+                }
+                _ => format!("<p{PARA_STYLE}>{value}</p>"),
+            };
+            MailBodyBlock::Text {
+                html,
+                monospace: matches!(role, Role::Code),
+            }
+        })
+        .collect()
 }
 
 fn prepare_table(rows: Vec<Vec<TableCell>>, out: &mut Vec<MailBodyBlock>) {
@@ -185,21 +249,47 @@ fn prepare_table(rows: Vec<Vec<TableCell>>, out: &mut Vec<MailBodyBlock>) {
         for (group, cells) in row.chunks(TABLE_COLUMNS_PER_BLOCK).enumerate() {
             if row.len() > TABLE_COLUMNS_PER_BLOCK {
                 let first = group * TABLE_COLUMNS_PER_BLOCK + 1;
-                let label = format!("表格第 {} 行 · 第 {first}–{} 列", row_index + 1, first + cells.len() - 1);
-                out.extend(text_parts(&label, Role::Paragraph, TEXT_CHUNK_BYTES, TEXT_CHUNK_LINES, false));
+                let label = format!(
+                    "表格第 {} 行 · 第 {first}–{} 列",
+                    row_index + 1,
+                    first + cells.len() - 1
+                );
+                out.extend(text_parts(
+                    &label,
+                    Role::Paragraph,
+                    TEXT_CHUNK_BYTES,
+                    TEXT_CHUNK_LINES,
+                    false,
+                ));
             }
             let count = cells.len().max(1);
-            let parts = cells.iter().map(|cell| {
-                if cell.occupied { Vec::new() } else {
-                    inline_parts(cell.spans.clone(), Role::Paragraph, (TEXT_CHUNK_BYTES / count).max(128), (TEXT_CHUNK_LINES / count).max(2))
-                }
-            }).collect::<Vec<_>>();
+            let parts = cells
+                .iter()
+                .map(|cell| {
+                    if cell.occupied {
+                        Vec::new()
+                    } else {
+                        inline_parts(
+                            cell.spans.clone(),
+                            Role::Paragraph,
+                            (TEXT_CHUNK_BYTES / count).max(128),
+                            (TEXT_CHUNK_LINES / count).max(2),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
             let continuations = parts.iter().map(Vec::len).max().unwrap_or(0).max(1);
             for index in 0..continuations {
-                out.push(MailBodyBlock::TableRow { cells: cells.iter().zip(&parts).map(|(cell, parts)| MailBodyCell {
-                    header: cell.header && !cell.occupied,
-                    content: parts.get(index).cloned(),
-                }).collect() });
+                out.push(MailBodyBlock::TableRow {
+                    cells: cells
+                        .iter()
+                        .zip(&parts)
+                        .map(|(cell, parts)| MailBodyCell {
+                            header: cell.header && !cell.occupied,
+                            content: parts.get(index).cloned(),
+                        })
+                        .collect(),
+                });
             }
         }
     }
@@ -209,11 +299,18 @@ fn prepare_table(rows: Vec<Vec<TableCell>>, out: &mut Vec<MailBodyBlock>) {
 mod tests {
     use super::*;
     fn markup(blocks: &[MailBodyBlock]) -> String {
-        blocks.iter().map(|block| match block {
-            MailBodyBlock::Text { html, .. } => html.clone(),
-            MailBodyBlock::Image { .. } => String::new(),
-            MailBodyBlock::TableRow { cells } => cells.iter().filter_map(|cell| cell.content.as_ref()).map(|block| markup(std::slice::from_ref(block))).collect(),
-        }).collect()
+        blocks
+            .iter()
+            .map(|block| match block {
+                MailBodyBlock::Text { html, .. } => html.clone(),
+                MailBodyBlock::Image { .. } => String::new(),
+                MailBodyBlock::TableRow { cells } => cells
+                    .iter()
+                    .filter_map(|cell| cell.content.as_ref())
+                    .map(|block| markup(std::slice::from_ref(block)))
+                    .collect(),
+            })
+            .collect()
     }
     #[test]
     fn literal_plain_text_cannot_become_markdown_html_or_a_resource() {
@@ -222,7 +319,11 @@ mod tests {
         let rendered = markup(&blocks);
         assert!(rendered.starts_with("<pre ") && rendered.contains("># literal [link]"));
         assert!(rendered.contains("&lt;img src=&#39;file:///secret&#39;&gt;"));
-        assert!(!rendered.contains("<img") && !rendered.contains("<script") && !rendered.contains("<a "));
+        assert!(
+            !rendered.contains("<img")
+                && !rendered.contains("<script")
+                && !rendered.contains("<a ")
+        );
         assert!(!rendered.contains('\r'));
     }
     #[test]
@@ -234,7 +335,9 @@ mod tests {
         assert!(text.contains("链接文本"));
         assert!(!text.contains("tracker.invalid") && !text.contains("danger()"));
         assert!(!text.contains("<img") && !text.contains("<a ") && !text.contains("src="));
-        assert!(blocks.iter().any(|block| matches!(block, MailBodyBlock::Image { cid, .. } if cid == "logo")));
+        assert!(blocks
+            .iter()
+            .any(|block| matches!(block, MailBodyBlock::Image { cid, .. } if cid == "logo")));
     }
 
     #[test]
@@ -272,7 +375,8 @@ mod tests {
         let split = chunks(&text, TEXT_CHUNK_BYTES, TEXT_CHUNK_LINES);
         assert_eq!(split.concat(), text);
         assert!(split.len() > 20);
-        assert!(split.iter().all(|part| part.len() <= TEXT_CHUNK_BYTES && part.chars().filter(|c| *c == '\n').count() <= TEXT_CHUNK_LINES));
+        assert!(split.iter().all(|part| part.len() <= TEXT_CHUNK_BYTES
+            && part.chars().filter(|c| *c == '\n').count() <= TEXT_CHUNK_LINES));
         assert!(prepare_blocks("", &text).iter().all(|block| matches!(block, MailBodyBlock::Text { html, .. } if html.len() <= TEXT_CHUNK_BYTES*6+64)));
     }
     #[test]
@@ -293,32 +397,72 @@ mod tests {
             "",
         );
         let text = markup(&blocks);
-        assert!(text.contains("<h2 style="), "heading missing inline style: {text}");
-        assert!(text.contains("<p style="), "paragraph missing inline style: {text}");
-        assert!(text.contains("<blockquote style="), "blockquote missing inline style: {text}");
-        assert!(text.contains("<pre style="), "pre missing inline style: {text}");
-        assert!(text.contains("line-height:1.65"), "paragraph line-height hook missing: {text}");
+        assert!(
+            text.contains("<h2 style="),
+            "heading missing inline style: {text}"
+        );
+        assert!(
+            text.contains("<p style="),
+            "paragraph missing inline style: {text}"
+        );
+        assert!(
+            text.contains("<blockquote style="),
+            "blockquote missing inline style: {text}"
+        );
+        assert!(
+            text.contains("<pre style="),
+            "pre missing inline style: {text}"
+        );
+        assert!(
+            text.contains("line-height:1.65"),
+            "paragraph line-height hook missing: {text}"
+        );
     }
     #[test]
     fn table_empty_span_cells_and_cids_do_not_shift_columns() {
         let blocks = prepare_blocks("<table><tr><th>A</th><th>B</th></tr><tr><td rowspan='2'>one<img src='cid:logo'></td><td>two</td></tr><tr><td>three</td></tr></table>", "");
-        let rows = blocks.iter().filter_map(|block| if let MailBodyBlock::TableRow { cells } = block { Some(cells) } else { None }).collect::<Vec<_>>();
+        let rows = blocks
+            .iter()
+            .filter_map(|block| {
+                if let MailBodyBlock::TableRow { cells } = block {
+                    Some(cells)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         assert!(rows.iter().all(|row| row.len() == 2));
         assert!(rows[0].iter().all(|cell| cell.header));
-        assert!(rows.iter().any(|row| matches!(&row[0].content, Some(MailBodyBlock::Image { cid, .. }) if cid == "logo")));
+        assert!(rows.iter().any(
+            |row| matches!(&row[0].content, Some(MailBodyBlock::Image { cid, .. }) if cid == "logo")
+        ));
         let last = rows.last().unwrap();
         assert!(last[0].content.is_none());
-        assert!(matches!(&last[1].content, Some(MailBodyBlock::Text { html, .. }) if html.contains("three")));
+        assert!(
+            matches!(&last[1].content, Some(MailBodyBlock::Text { html, .. }) if html.contains("three"))
+        );
     }
     #[test]
     fn huge_tables_bound_work_per_row_and_preserve_tail_content() {
-        let row = format!("<tr>{}</tr>", (0..65).map(|n|format!("<td>column-{n} {}</td>", "超长单元格".repeat(200))).collect::<String>());
-        let blocks = prepare_blocks(&format!("<table>{row}<tr><td>TAIL-KEEP</td></tr></table>"), "");
+        let row = format!(
+            "<tr>{}</tr>",
+            (0..65)
+                .map(|n| format!("<td>column-{n} {}</td>", "超长单元格".repeat(200)))
+                .collect::<String>()
+        );
+        let blocks = prepare_blocks(
+            &format!("<table>{row}<tr><td>TAIL-KEEP</td></tr></table>"),
+            "",
+        );
         assert!(blocks.len() > 65);
         for block in &blocks {
             if let MailBodyBlock::TableRow { cells } = block {
                 assert!(cells.len() <= TABLE_COLUMNS_PER_BLOCK);
-                let bytes: usize = cells.iter().filter_map(|cell| cell.content.as_ref()).map(|part| markup(std::slice::from_ref(part)).len()).sum();
+                let bytes: usize = cells
+                    .iter()
+                    .filter_map(|cell| cell.content.as_ref())
+                    .map(|part| markup(std::slice::from_ref(part)).len())
+                    .sum();
                 assert!(bytes <= TEXT_CHUNK_BYTES * 6 + 1024);
             }
         }

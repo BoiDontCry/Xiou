@@ -15,6 +15,8 @@ pub struct SingleInstance {
 }
 
 impl SingleInstance {
+    // 并列 cfg 语句块无法共享尾表达式，需要显式 return。
+    #[allow(clippy::needless_return)]
     pub(crate) fn noop() -> Self {
         #[cfg(windows)]
         {
@@ -39,6 +41,7 @@ impl Drop for SingleInstance {
     }
 }
 
+#[allow(clippy::needless_return)]
 pub fn acquire() -> AcquireResult {
     #[cfg(windows)]
     {

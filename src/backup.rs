@@ -4,8 +4,6 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::credentials;
-use crate::imap_config::{HOST, PORT, USER};
 use crate::imap_errors::login_error;
 use crate::mime_plan::{self, DeferredAttachment, MimePlan};
 use imap::Session;
@@ -264,14 +262,23 @@ pub fn connect(
     Err(last_error.unwrap_or_else(|| format!("无法解析 {host}:{port}").into()))
 }
 
-/// 用默认账号（imap_config 常量）+ 环境变量/DPAPI 密码跑全量备份。
-/// 供 CLI 与 GUI 复用。`progress` 在 IMAP 网络线程的调用栈里同步回调。
+/// 用已保存账号配置（DPAPI）的收信设置跑全量备份。供 CLI 复用。
+/// `progress` 在 IMAP 网络线程的调用栈里同步回调。
 pub fn run_backup(
     options: &BackupOptions,
     progress: &mut dyn Progress,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let password = credentials::load_or_initialize(false)?;
-    run_backup_with(options, HOST, PORT, USER, password.as_str(), progress)
+    let account = crate::account_config::load()
+        .map_err(|error| format!("读取账号配置失败：{error}"))?
+        .ok_or("未找到邮箱账号配置，请先在 xiou 中配置账号")?;
+    run_backup_with(
+        options,
+        &account.incoming.host,
+        account.incoming.port,
+        &account.incoming.user,
+        &account.incoming.password,
+        progress,
+    )
 }
 
 /// 显式传入账号凭据跑备份。GUI 用这个传入用户填写的 host/port/user/password。

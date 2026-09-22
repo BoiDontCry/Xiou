@@ -481,8 +481,10 @@ mod tests {
 
     #[test]
     fn custom_same_text_and_canvas_cannot_save() {
-        let mut prefs = Prefs::default();
-        prefs.palette = Palette::Custom;
+        let mut prefs = Prefs {
+            palette: Palette::Custom,
+            ..Prefs::default()
+        };
         prefs.custom_dark.text = prefs.custom_dark.canvas;
         assert!(!prefs.can_save_custom());
     }
@@ -511,11 +513,13 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("prefs.json");
-        let mut prefs = Prefs::default();
-        prefs.scheme = ColorScheme::Light;
-        prefs.palette = Palette::Purple;
-        prefs.hide_sender_avatar = true;
-        prefs.workspace = WorkspaceMode::Minimal;
+        let prefs = Prefs {
+            scheme: ColorScheme::Light,
+            palette: Palette::Purple,
+            hide_sender_avatar: true,
+            workspace: WorkspaceMode::Minimal,
+            ..Default::default()
+        };
         save_to(&path, &prefs).unwrap();
         let loaded = load_from(&path).unwrap();
         assert_eq!(loaded, prefs);
