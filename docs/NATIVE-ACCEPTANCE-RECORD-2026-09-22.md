@@ -4,10 +4,10 @@
 
 - 日期：2026-09-22
 - 产物：`dist/xiou-0.1.0-windows-x64.zip`
-  - ZIP SHA-256：`926f9d6c03d698435f69dc3fca7573da735e53f1456a1794cb3bd12d352ed3b0`
-    （含设置页"重新配置邮箱账号"入口的复打包；双次打包哈希一致，记录
-    `dist/_zip-run-A.txt`、`dist/_zip-run-B.txt`）
-  - `xiou.exe` SHA-256：`f9258033362cbc55180493ae01b8e16de0a848ca7db671777c9acf79b5a512cf`
+  - ZIP SHA-256：`773b9b8b241a4ea18a4bdbdf9e47d76b27f8c6f3d89210ad970ff7ce86be68fe`
+    （含设置页"重新配置邮箱账号"入口 + 引导卡片视口内纵向滚动的复打包；
+    双次打包哈希一致，记录 `dist/_zip-run-A.txt`、`dist/_zip-run-B.txt`）
+  - `xiou.exe` SHA-256：`389fa8e2cf05c82d15519c07cbe3b15fbd74e4b49f621f1c8500771da7e1a342`
   - 运行位置：`D:\code\foxmail-rs\dist\acceptance\xiou-0.1.0-windows-x64\`
 - 系统：Windows 11 专业版 10.0.26200（build 26200），zh-CN，微软拼音
 - DPI：启动时 100%（N5 单项覆盖 150%/200%）

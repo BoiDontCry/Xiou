@@ -1400,6 +1400,8 @@ impl MailApp {
         let smtp_security = onboarding.security;
         let error = onboarding.error.clone();
         let host_label = onboarding.host.read(cx).value().to_string();
+        let card_width = (window.rem_size() * 26.25).min(window.viewport_size().width - px(32.));
+        let card_max_height = window.viewport_size().height - px(48.);
         let _ = (window, host_label);
 
         let mut card = div()
@@ -1507,12 +1509,20 @@ impl MailApp {
                 .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
         );
 
+        // SMTP 字段加入后卡片可能超出视口：与 sync-panel 相同的最大高度 +
+        // 纵向滚动，避免矮窗口下只能看到上方字段。
         div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .child(card)
+            .child(
+                card.id("onboarding-card")
+                    .test_support()
+                    .w(card_width)
+                    .max_h(card_max_height)
+                    .overflow_y_scroll(),
+            )
     }
 
     fn render_sync_panel(

@@ -29,7 +29,9 @@
   environment variables only.
 - Settings page gains a “邮箱账号” section with a “重新配置邮箱账号…”
   entry: it closes the dialog and returns to the pre-filled onboarding page,
-  giving receive-only migrated accounts a path to add SMTP sending.
+  giving receive-only migrated accounts a path to add SMTP sending. The
+  onboarding card now clamps to the viewport (width and height) and scrolls
+  vertically, so SMTP fields stay reachable on short windows.
   (`-D warnings`), deleted dead `account_monogram`, boxed the
   `SendState::Sending` variant payload, and re-ran the full gate chain:
   fmt/check/tests (63 lib + 64 bin), 226 native migration checks, clippy,
@@ -37,7 +39,7 @@
 - Repackaged `xiou-0.1.0-windows-x64.zip` (after adding the settings-page
   account re-entry): two independent package runs
   produce the identical SHA-256
-  `926f9d6c03d698435f69dc3fca7573da735e53f1456a1794cb3bd12d352ed3b0`
+  `773b9b8b241a4ea18a4bdbdf9e47d76b27f8c6f3d89210ad970ff7ce86be68fe`
   (records: `dist/_zip-run-A.txt`, `dist/_zip-run-B.txt`). Privacy rescan of
   the shipped EXE found no build paths, no real addresses, and no real
   server domains; isolated auto-exit startup passed with code 0. The
