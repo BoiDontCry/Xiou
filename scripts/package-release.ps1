@@ -2,7 +2,7 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-$expectedPowerShellVersion = '7.6.3'
+$expectedPowerShellVersion = '7.6.6'
 $expectedRustVersion = '1.97.1'
 $expectedRustHost = 'x86_64-pc-windows-msvc'
 $expectedCargoVersion = '1.97.1'
@@ -129,7 +129,7 @@ try {
         throw '未找到当前 Cargo 包。'
     }
 
-    $packageName = "foxmail-rs-$($package.version)-windows-x64"
+    $packageName = "xiou-$($package.version)-windows-x64"
     $stageRoot = Join-Path $distRoot $packageName
     $zipPath = Join-Path $distRoot "$packageName.zip"
     $zipHashPath = "$zipPath.sha256"
@@ -177,7 +177,7 @@ try {
     )
 
     $buildMessages = @(
-        & $cargoPath build @releaseProfileConfig --offline --locked --release --bin foxmail-rs --target $expectedRustHost --message-format=json-render-diagnostics |
+        & $cargoPath build @releaseProfileConfig --offline --locked --release --bin xiou --target $expectedRustHost --message-format=json-render-diagnostics |
             ForEach-Object { $_ | ConvertFrom-Json }
     )
     if ($LASTEXITCODE -ne 0) {
@@ -185,17 +185,17 @@ try {
     }
 
     $releaseExe = $buildMessages |
-        Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'foxmail-rs' -and $null -ne $_.executable } |
+        Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'xiou' -and $null -ne $_.executable } |
         Select-Object -Last 1 -ExpandProperty executable
     if ([string]::IsNullOrWhiteSpace($releaseExe) -or -not (Test-Path -LiteralPath $releaseExe)) {
-        throw 'Cargo 未返回 foxmail-rs 的实际产物路径。'
+        throw 'Cargo 未返回 xiou 的实际产物路径。'
     }
-    $stagedExe = Join-Path $stageRoot 'foxmail-rs.exe'
+    $stagedExe = Join-Path $stageRoot 'xiou.exe'
     Copy-Item -LiteralPath $releaseExe -Destination $stagedExe
     Copy-Item -LiteralPath $readmePath -Destination $stageRoot
 
     $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedExe).Hash
-    "$exeHash  foxmail-rs.exe" | Set-Content -Encoding utf8 (Join-Path $stageRoot 'SHA256SUMS.txt')
+    "$exeHash  xiou.exe" | Set-Content -Encoding utf8 (Join-Path $stageRoot 'SHA256SUMS.txt')
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archiveTime = [DateTimeOffset]::new(2000, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
     $archive = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
