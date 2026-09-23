@@ -255,16 +255,34 @@ impl MailStore {
         Ok(summary)
     }
 
+    /// 删除一个账号在该索引中的全部邮箱（消息经外键级联清除）。返回删除的邮箱数。
+    pub fn delete_account(&mut self, user: &str, server: &str) -> StoreResult<usize> {
+        let deleted = self.connection.execute(
+            "DELETE FROM mailbox WHERE account = ?1 AND server = ?2",
+            rusqlite::params![user, server],
+        )?;
+        Ok(deleted)
+    }
+
     /// 导入散装 `.eml` 目录（Foxmail 等客户端导出的历史邮件，文件名是主题而非 UID）。
     /// 邮件直接并入该账号的收件箱，与 IMAP 邮件同列表按日期排序；`eml_path` 存绝对路径，
     /// 因为归档目录通常不在索引目录下。
-    pub fn import_archive(&mut self, archive_root: &Path) -> StoreResult<ImportSummary> {
+    /// 导入散装 `.eml` 归档。多账号索引须显式给 `target`（收信用户名 + 服务器）；
+    /// `None` 时仅唯一账号可用（兼容旧单账号行为）。
+    pub fn import_archive(
+        &mut self,
+        archive_root: &Path,
+        target: Option<(&str, &str)>,
+    ) -> StoreResult<ImportSummary> {
         let root = if archive_root.is_absolute() {
             archive_root.to_path_buf()
         } else {
             std::env::current_dir()?.join(archive_root)
         };
-        let (account, server) = self.sole_account()?;
+        let (account, server) = match target {
+            Some((user, server)) => (user.to_owned(), server.to_owned()),
+            None => self.sole_account()?,
+        };
         let files = list_eml_files_recursive(&root)?;
         let discovered = files.len();
         let source_root = self.source_root.clone();
@@ -2268,7 +2286,7 @@ AAE=\r\n\
             "server-1@example.com",
         );
 
-        let first = store.import_archive(&archive).unwrap();
+        let first = store.import_archive(&archive, None).unwrap();
         assert_eq!(first.discovered_messages, 3);
         assert_eq!(first.inserted, 2);
         assert_eq!(first.skipped, 1, "与服务器邮件同 Message-ID 的那封必须跳过");
@@ -2314,7 +2332,7 @@ AAE=\r\n\
         assert!(hits[0].mailbox.eq_ignore_ascii_case("INBOX") || !hits[0].mailbox.is_empty());
 
         // 同一批文件重跑：归档行整批重建，结果稳定（inserted 恒等于去重后的数量）。
-        let second = store.import_archive(&archive).unwrap();
+        let second = store.import_archive(&archive, None).unwrap();
         assert_eq!(second.inserted, 2);
         assert_eq!(second.updated, 0);
         assert_eq!(second.skipped, 1);

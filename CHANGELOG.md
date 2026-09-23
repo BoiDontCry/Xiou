@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Multi-account support — 2026-09-23 (unreleased)
+
+- Account config schema v3: `account-config.dpapi` now stores an account
+  list (`{schema_version: 3, accounts: [...]}`). v2 single-account and
+  legacy flat configs upgrade read-only to a one-element list on load;
+  unknown versions still fail loudly. New `account_config::list()` /
+  `save_all()`; `load()`/`save()` remain as first-account compatibility
+  shims. DPAPI round-trip covered by tests.
+- Sync walks all saved accounts sequentially through one global sync slot
+  (`sync_queue`): background polls and Ctrl+Shift+S enqueue every account,
+  adding/editing an account syncs just that one, a failed account does not
+  block the rest of the queue.
+- Settings page “邮箱账号” section is now a real account list: one row per
+  saved account (user@host, 收发/仅收信) with 重新配置 (edit via the
+  onboarding card, prefilled) and a two-step 删除 (config entry + index
+  rows via `MailStore::delete_account` FK cascade + local backup dir
+  removal), plus 添加邮箱账号… for new accounts. Duplicate identities are
+  rejected; saving no longer wipes the workspace once accounts exist.
+- Compose sender identity: the window carries the account owning the
+  selected mailbox (replies/forwards use the message's account; Ctrl+N
+  falls back to the first SMTP-capable account). `begin_send` resolves the
+  frozen `SendRequest` from that identity at click time; drafts stay keyed
+  by kind+message id.
+- `import-eml --account user@host` targets one account when importing
+  scattered `.eml` archives into a multi-account index; omitting it keeps
+  the old sole-account behavior (and errors clearly when ambiguous).
+- Gates: fmt/check, 64 lib-bin + 65 lib tests, 226 native checks, clippy
+  -D warnings, release build, reproducible double-package
+  (ecc9e9c9...9a13e).
+
 ### Unified account model + SMTP send refactor (phase 2) — 2026-09-22 (unreleased)
 
 - New `src/account_config.rs`: versioned (`schema_version = 2`) account model

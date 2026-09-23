@@ -152,6 +152,10 @@ pub struct MailApp {
     sync_generation: u64,
     sync_import_started: bool,
     sync_user_requested: bool,
+    /// 待同步账号队列：完成一个自动开始下一个（串行，不做并发 IMAP）。
+    sync_queue: Vec<AccountConfig>,
+    /// 设置页删除确认：记录待删除账号在配置列表中的索引，第二次点击才真删。
+    pending_account_removal: Option<usize>,
     sync_status_hidden: bool,
     preview: Option<PreviewState>,
     preview_generation: usize,
@@ -323,6 +327,8 @@ struct Onboarding {
     smtp_password: InputEntity,
     smtp_from: InputEntity,
     security: foxmail_imap::account_config::SmtpSecurity,
+    /// Some(index)：编辑配置列表中第 index 个账号；None：新增账号。
+    editing: Option<usize>,
     _subscriptions: Vec<gpui::Subscription>,
     error: Option<SharedString>,
 }
@@ -655,6 +661,8 @@ impl MailApp {
             sync_generation: 0,
             sync_import_started: false,
             sync_user_requested: false,
+            sync_queue: Vec::new(),
+            pending_account_removal: None,
             sync_status_hidden: false,
             preview: None,
             preview_generation: 0,
@@ -800,6 +808,7 @@ impl MailApp {
             smtp_password,
             smtp_from,
             security,
+            editing: None,
             _subscriptions: subscriptions,
             error: None,
         }
@@ -947,7 +956,39 @@ impl MailApp {
                 return;
             }
         };
-        if let Err(error) = account_config::save(&account) {
+        // 编辑现有账号：整体替换该身份的旧配置；新账号：追加。
+        // 重复身份（同用户名+服务器）不允许重复添加。
+        let mut accounts = match account_config::list() {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                self.update_onboarding_error(
+                    Some(SharedString::from(format!("读取账号配置失败：{error}"))),
+                    cx,
+                );
+                return;
+            }
+        };
+        let editing = self.onboarding.as_ref().and_then(|o| o.editing);
+        let identity = account.identity();
+        match editing {
+            Some(index) if index < accounts.len() => {
+                accounts[index] = account.clone();
+            }
+            _ => {
+                if accounts
+                    .iter()
+                    .any(|existing| existing.identity() == identity)
+                {
+                    self.update_onboarding_error(
+                        Some(SharedString::from("该邮箱账号已存在，请直接编辑它")),
+                        cx,
+                    );
+                    return;
+                }
+                accounts.push(account.clone());
+            }
+        }
+        if let Err(error) = account_config::save_all(&accounts) {
             self.update_onboarding_error(
                 Some(SharedString::from(format!("保存账号配置失败：{error}"))),
                 cx,
@@ -963,8 +1004,15 @@ impl MailApp {
             );
             cx.notify();
         }
+        let first_account = accounts.len() == 1;
         self.onboarding = None;
-        self.run_sync_pipeline(account, true, cx);
+        if first_account {
+            // 首个账号：走首启同步（全屏进度，完成后建立索引）。
+            self.run_sync_pipeline(account, true, cx);
+        } else {
+            // 已有账号时新增/编辑：只同步该账号，工作区保留。
+            self.request_sync_account(account, cx);
+        }
     }
 
     /// 后台轮询入口：已有配置且当前空闲时自动拉新邮件。
@@ -972,6 +1020,7 @@ impl MailApp {
         self.request_sync(false, cx);
     }
 
+    /// 手动（Ctrl+Shift+S）同步全部账号；后台轮询入队所有账号逐个串行执行。
     fn request_sync(&mut self, user_requested: bool, cx: &mut Context<Self>) {
         if user_requested {
             self.sync_status_hidden = false;
@@ -980,9 +1029,12 @@ impl MailApp {
         if self.onboarding.is_some() || self.sync.as_ref().is_some_and(SyncState::is_busy) {
             return;
         }
-        match account_config::load() {
-            Ok(Some(account)) => self.run_sync_pipeline(account, user_requested, cx),
-            Ok(None) if user_requested => {
+        match account_config::list() {
+            Ok(accounts) if !accounts.is_empty() => {
+                self.sync_queue = accounts;
+                self.start_next_queued_sync(user_requested, cx);
+            }
+            Ok(_) if user_requested => {
                 self.feedback.push(
                     NoticeKind::Sync,
                     NoticeLevel::Warning,
@@ -1002,6 +1054,28 @@ impl MailApp {
             }
             _ => {} // An unconfigured background poll is not an operation failure.
         }
+    }
+
+    /// 只同步指定账号（新增/编辑账号后用）；正在忙时替换队列头并等待。
+    fn request_sync_account(&mut self, account: AccountConfig, cx: &mut Context<Self>) {
+        if self.sync.as_ref().is_some_and(SyncState::is_busy) {
+            self.sync_queue.push(account);
+            return;
+        }
+        self.sync_queue = vec![account];
+        self.start_next_queued_sync(true, cx);
+    }
+
+    /// 队列非空时启动下一个账号的同步。
+    fn start_next_queued_sync(&mut self, user_requested: bool, cx: &mut Context<Self>) {
+        if self.onboarding.is_some() || self.sync.as_ref().is_some_and(SyncState::is_busy) {
+            return;
+        }
+        let Some(account) = self.sync_queue.first().cloned() else {
+            return;
+        };
+        self.sync_queue.remove(0);
+        self.run_sync_pipeline(account, user_requested, cx);
     }
 
     fn begin_sync(&mut self, user_requested: bool, cx: &mut Context<Self>) -> Option<u64> {
@@ -1309,6 +1383,7 @@ impl MailApp {
                 format!("下载 {backed_up} 封，跳过 {skipped} 封，索引已就绪。"),
             );
         }
+        self.start_next_queued_sync(self.sync_user_requested, cx);
         cx.notify();
     }
 
@@ -1325,8 +1400,16 @@ impl MailApp {
         let error = error.into();
         self.sync = Some(SyncState::Failed(error.clone()));
         self.sync_status_hidden = false;
-        self.feedback
-            .push(NoticeKind::Sync, NoticeLevel::Error, "同步失败", error);
+        self.feedback.push(
+            NoticeKind::Sync,
+            NoticeLevel::Error,
+            "同步失败",
+            error.clone(),
+        );
+        // 单账号失败不阻塞队列里其它账号（队列推进要求空闲状态，先清掉 Failed）。
+        self.sync = None;
+        self.start_next_queued_sync(self.sync_user_requested, cx);
+        self.sync = Some(SyncState::Failed(error));
         cx.notify();
     }
 
@@ -1595,24 +1678,194 @@ impl MailApp {
             })
     }
 
-    /// 设置页“重新配置邮箱账号”入口：关掉设置弹层并回到预填的引导页
-    /// （SMTP 字段在此页配置）。
-    fn reopen_account_setup(
+    /// 设置页账号列表：每个已保存账号一行（身份 + 收发标注 + 编辑/删除）。
+    fn render_account_rows(&self, cx: &mut Context<Self>, theme: Theme) -> Vec<gpui::AnyElement> {
+        let accounts = account_config::list().unwrap_or_default();
+        let _ = cx;
+        accounts
+            .into_iter()
+            .enumerate()
+            .map(|(index, account)| {
+                let capability = if account.outgoing.is_some() {
+                    "收发"
+                } else {
+                    "仅收信"
+                };
+                let label = SharedString::from(format!(
+                    "{}@{}（{capability}）",
+                    account.incoming.user, account.incoming.host
+                ));
+                let (remove_label, remove_id) = if self.pending_account_removal == Some(index) {
+                    ("确认删除？", format!("confirm-remove-account-{index}"))
+                } else {
+                    ("删除", format!("remove-account-{index}"))
+                };
+                div()
+                    .id(format!("account-row-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.text)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .child(
+                                control_button(
+                                    SharedString::from(format!("edit-account-{index}")),
+                                    theme,
+                                    ButtonKind::Secondary,
+                                    false,
+                                )
+                                .text_xs()
+                                .child("重新配置")
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.edit_account_clicked(index, window, cx)
+                                    },
+                                )),
+                            )
+                            .child(
+                                control_button(
+                                    SharedString::from(remove_id),
+                                    theme,
+                                    ButtonKind::Secondary,
+                                    false,
+                                )
+                                .text_xs()
+                                .child(remove_label)
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.remove_account_clicked(index, window, cx)
+                                    },
+                                )),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn add_account_clicked(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_account_removal = None;
+        self.close_settings(window, cx);
+        self.open_account_editor(None, window, cx);
+    }
+
+    fn edit_account_clicked(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_account_removal = None;
+        self.close_settings(window, cx);
+        self.open_account_editor(Some(index), window, cx);
+    }
+
+    fn remove_account_clicked(
         &mut self,
-        _: &ClickEvent,
+        index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_account_removal != Some(index) {
+            // 第一次点击：仅进入确认态。
+            self.pending_account_removal = Some(index);
+            cx.notify();
+            return;
+        }
+        self.pending_account_removal = None;
+        let mut accounts = account_config::list().unwrap_or_default();
+        let Some(account) = (index < accounts.len()).then(|| accounts.remove(index)) else {
+            return;
+        };
+        if let Err(error) = account_config::save_all(&accounts) {
+            self.feedback.push(
+                NoticeKind::Sync,
+                NoticeLevel::Error,
+                "删除账号失败",
+                format!("保存账号配置失败：{error}"),
+            );
+            cx.notify();
+            return;
+        }
+        self.delete_account_data(&account, cx);
         self.close_settings(window, cx);
-        self.return_to_onboarding(window, cx);
+        let _ = self.reload_index(cx);
+        self.feedback.push(
+            NoticeKind::Sync,
+            NoticeLevel::Success,
+            "已删除账号",
+            format!("{} 及其本地邮件已移除。", account.incoming.user),
+        );
+        cx.notify();
+    }
+
+    /// 删除账号的索引行（级联消息）与其本地备份目录。仅限 data 根下的账号子目录。
+    fn delete_account_data(&mut self, account: &AccountConfig, cx: &mut Context<Self>) {
+        if let Some(store) = self.store.as_ref() {
+            let _ = store;
+        }
+        let index_path = self.paths.index.clone();
+        let user = account.incoming.user.clone();
+        let server = account.incoming.host.clone();
+        let data_root = self.paths.index.parent().map(|p| p.to_path_buf());
+        let backup_dir = data_root
+            .as_deref()
+            .map(|root| root.join(backup::safe_component(&user)));
+        let task = cx.background_executor().spawn(async move {
+            std::thread::spawn(move || -> Result<(), String> {
+                let mut store = MailStore::open(&index_path).map_err(|error| error.to_string())?;
+                store
+                    .delete_account(&user, &server)
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .join()
+            .unwrap_or_else(|_| Err("删除线程异常退出".into()))
+        });
+        let removed_backup = backup_dir.and_then(|dir| {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).ok()
+            } else {
+                Some(())
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |_this, _cx| {
+                let _ = (result, removed_backup);
+            });
+        })
+        .detach();
     }
 
     fn return_to_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let defaults = account_config::load()
-            .ok()
-            .flatten()
-            .unwrap_or_else(AccountConfig::blank);
-        let onboarding = Self::build_onboarding(window, cx, defaults);
+        self.open_account_editor(Some(0), window, cx);
+    }
+
+    /// 打开账号编辑/新增卡片：index = Some(i) 编辑第 i 个账号；None 新增。
+    /// 不会清空已选中的邮件数据；仅替换 onboarding 卡片视图。
+    fn open_account_editor(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let defaults = match index {
+            Some(i) => account_config::list()
+                .ok()
+                .and_then(|accounts| accounts.into_iter().nth(i))
+                .unwrap_or_else(AccountConfig::blank),
+            None => AccountConfig::blank(),
+        };
+        let mut onboarding = Self::build_onboarding(window, cx, defaults);
+        onboarding.editing = index;
         // build_onboarding 已把 password 初始化为空；host/port/user 从保存的配置预填。
         self.onboarding = Some(onboarding);
         self.sync = None;
@@ -1953,19 +2206,47 @@ impl MailApp {
         });
     }
 
+    /// 当前选中邮箱所属账号的收信用户名（写信身份用）。
+    fn selected_mailbox_account_user(&self) -> Option<String> {
+        let selected = self.selected_mailbox?;
+        self.accounts
+            .iter()
+            .find(|account| account.mailboxes.iter().any(|m| m.id == selected))
+            .map(|account| account.account.clone())
+    }
+
     fn compose(&mut self, _: &Compose, _: &mut Window, cx: &mut Context<Self>) {
-        crate::compose_window::ComposeWindow::open(crate::compose_window::ComposeKind::New, cx);
+        let sender = self.selected_mailbox_account_user();
+        crate::compose_window::ComposeWindow::open_with_sender(
+            crate::compose_window::ComposeKind::New,
+            sender,
+            cx,
+        );
     }
 
     fn reply(&mut self, _: &Reply, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(detail) = self.selected_detail.clone() {
-            crate::compose_window::ComposeWindow::reply(&detail, cx);
+            let sender = self.selected_mailbox_account_user();
+            crate::compose_window::ComposeWindow::open_with_sender(
+                crate::compose_window::ComposeKind::Reply(crate::compose_window::reply_draft(
+                    &detail,
+                )),
+                sender,
+                cx,
+            );
         }
     }
 
     fn forward(&mut self, _: &Forward, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(detail) = self.selected_detail.clone() {
-            crate::compose_window::ComposeWindow::forward(&detail, cx);
+            let sender = self.selected_mailbox_account_user();
+            crate::compose_window::ComposeWindow::open_with_sender(
+                crate::compose_window::ComposeKind::Forward(crate::compose_window::forward_draft(
+                    &detail,
+                )),
+                sender,
+                cx,
+            );
         }
     }
 
@@ -4285,6 +4566,7 @@ impl MailApp {
                         .child(settings_label(theme, "工作区"))
                         .child(self.render_workspace_row(cx, draft.workspace, theme))
                         .child(settings_label(theme, "邮箱账号"))
+                        .children(self.render_account_rows(cx, theme))
                         .child(
                             div()
                                 .flex()
@@ -4299,14 +4581,14 @@ impl MailApp {
                                 )
                                 .child(
                                     control_button(
-                                        "reopen-account-setup",
+                                        "add-account-button",
                                         theme,
                                         ButtonKind::Secondary,
                                         false,
                                     )
                                     .text_xs()
-                                    .child("重新配置邮箱账号…")
-                                    .on_click(cx.listener(Self::reopen_account_setup)),
+                                    .child("添加邮箱账号…")
+                                    .on_click(cx.listener(Self::add_account_clicked)),
                                 ),
                         ),
                 )

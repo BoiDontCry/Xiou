@@ -10,7 +10,8 @@ const CREDENTIAL_DIR: &str = "credentials";
 const ACCOUNT_FILE: &str = "account-config.dpapi";
 
 /// 当前配置结构版本。读取时版本不匹配明确报错，不猜测。
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3：多账号列表；v2/旧扁平为单账号（读取时自动升级为单元素列表）。
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImapConfig {
@@ -40,7 +41,7 @@ pub enum SmtpSecurity {
     StartTls,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub schema_version: u32,
     pub incoming: ImapConfig,
@@ -62,42 +63,20 @@ impl AccountConfig {
         }
     }
 
-    /// 新版结构解析失败后回退旧扁平结构（host/port/user/password）并迁移：
-    /// 旧字段映射为 `incoming`，`outgoing` 保持 `None`（不按域名猜测 SMTP）。
-    pub fn parse(json: &str) -> Result<Self, String> {
-        let value: serde_json::Value =
-            serde_json::from_str(json).map_err(|error| format!("账号配置 JSON 无效：{error}"))?;
-        if let Ok(new) = serde_json::from_value::<NewShape>(value.clone()) {
-            if new.schema_version == SCHEMA_VERSION {
-                return Ok(Self {
-                    schema_version: new.schema_version,
-                    incoming: new.incoming,
-                    outgoing: new.outgoing,
-                });
-            }
-            return Err(format!(
-                "不支持的账号配置版本 {}（当前支持 {SCHEMA_VERSION}，请更新程序）",
-                new.schema_version
-            ));
-        }
-        if let Ok(legacy) = serde_json::from_value::<LegacyShape>(value) {
-            return Ok(Self::migrate_legacy(legacy));
-        }
-        Err("无法识别账号配置格式".to_owned())
+    /// 账号身份键：收信账号 + 服务器，用于去重与查找。
+    pub fn identity(&self) -> (String, String) {
+        (
+            self.incoming.user.trim().to_owned(),
+            self.incoming.host.trim().to_owned(),
+        )
     }
 
-    /// 旧配置迁移：仅收信设置，不虚构发件配置。
-    fn migrate_legacy(legacy: LegacyShape) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            incoming: ImapConfig {
-                host: legacy.host,
-                port: legacy.port,
-                user: legacy.user,
-                password: legacy.password,
-            },
-            outgoing: None,
-        }
+    /// 兼容旧单账号 API：取列表第一个账号（读取时 v2/扁平自动升级为单元素列表）。
+    pub fn parse(json: &str) -> Result<Self, String> {
+        Ok(parse_list(json)?
+            .into_iter()
+            .next()
+            .unwrap_or_else(Self::blank))
     }
 
     /// 发送前完整性校验；错误信息不回显任何密码。
@@ -134,6 +113,54 @@ impl AccountConfig {
             .map_err(|error| format!("发件地址无效：{error}"))?;
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ListShape {
+    schema_version: u32,
+    accounts: Vec<AccountConfig>,
+}
+
+/// 解析多账号配置：v3 直接用；v2/旧扁平升级为单元素列表。
+/// 版本不匹配明确报错，不猜测。
+pub fn parse_list(json: &str) -> Result<Vec<AccountConfig>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("账号配置 JSON 无效：{error}"))?;
+    if let Ok(v3) = serde_json::from_value::<ListShape>(value.clone()) {
+        if v3.schema_version == SCHEMA_VERSION {
+            return Ok(v3.accounts);
+        }
+        return Err(format!(
+            "不支持的账号配置版本 {}（当前支持 {SCHEMA_VERSION}，请更新程序）",
+            v3.schema_version
+        ));
+    }
+    if let Ok(v2) = serde_json::from_value::<NewShape>(value.clone()) {
+        if v2.schema_version == 2 || v2.schema_version == SCHEMA_VERSION {
+            return Ok(vec![AccountConfig {
+                schema_version: SCHEMA_VERSION,
+                incoming: v2.incoming,
+                outgoing: v2.outgoing,
+            }]);
+        }
+        return Err(format!(
+            "不支持的账号配置版本 {}（当前支持 {SCHEMA_VERSION}，请更新程序）",
+            v2.schema_version
+        ));
+    }
+    if let Ok(legacy) = serde_json::from_value::<LegacyShape>(value) {
+        return Ok(vec![AccountConfig {
+            schema_version: SCHEMA_VERSION,
+            incoming: ImapConfig {
+                host: legacy.host,
+                port: legacy.port,
+                user: legacy.user,
+                password: legacy.password,
+            },
+            outgoing: None,
+        }]);
+    }
+    Err("无法识别账号配置格式".to_owned())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -204,24 +231,41 @@ pub fn config_path() -> io::Result<PathBuf> {
         .join(ACCOUNT_FILE))
 }
 
-/// DPAPI 加密整个账号 JSON（含两套密码）落盘。复用 credentials 的加密原语。
-pub fn save(config: &AccountConfig) -> io::Result<()> {
-    let path = config_path()?;
-    let json = serde_json::to_vec(config).map_err(io::Error::other)?;
-    credentials::save_password(&path, &json)
+/// DPAPI 加密整个账号列表 JSON（含所有密码）落盘。复用 credentials 的加密原语。
+pub fn save_all(accounts: &[AccountConfig]) -> io::Result<()> {
+    save_all_to(&config_path()?, accounts)
 }
 
-/// 读取并解析；旧扁平配置自动迁移为收信-only，不悄悄覆盖原文件。
-pub fn load() -> Result<Option<AccountConfig>, String> {
-    let path = config_path().map_err(|error| error.to_string())?;
+fn save_all_to(path: &std::path::Path, accounts: &[AccountConfig]) -> io::Result<()> {
+    let shape = ListShape {
+        schema_version: SCHEMA_VERSION,
+        accounts: accounts.to_vec(),
+    };
+    let json = serde_json::to_vec(&shape).map_err(io::Error::other)?;
+    credentials::save_password(path, &json)
+}
+
+/// 兼容旧单账号保存：整体覆盖为单账号列表。
+pub fn save(config: &AccountConfig) -> io::Result<()> {
+    save_all(std::slice::from_ref(config))
+}
+
+/// 读取账号列表；旧 v2/扁平配置自动升级为单元素列表，不悄悄覆盖原文件。
+pub fn list() -> Result<Vec<AccountConfig>, String> {
+    list_from(&config_path().map_err(|error| error.to_string())?)
+}
+
+fn list_from(path: &std::path::Path) -> Result<Vec<AccountConfig>, String> {
     if !path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let json = credentials::load_password(&path).map_err(|error| error.to_string())?;
-    match AccountConfig::parse(&json) {
-        Ok(config) => Ok(Some(config)),
-        Err(message) => Err(message),
-    }
+    let json = credentials::load_password(path).map_err(|error| error.to_string())?;
+    parse_list(&json)
+}
+
+/// 兼容旧单账号读取：取第一个账号。
+pub fn load() -> Result<Option<AccountConfig>, String> {
+    Ok(list()?.into_iter().next())
 }
 
 #[cfg(test)]
@@ -269,7 +313,40 @@ mod tests {
         let parsed = AccountConfig::parse(&json).unwrap();
         assert_eq!(parsed.incoming, config.incoming);
         assert_eq!(parsed.outgoing, config.outgoing);
-        assert_eq!(parsed.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v3_list_roundtrips_and_deduplicates_by_identity() {
+        let a = AccountConfig {
+            schema_version: SCHEMA_VERSION,
+            incoming: sample_incoming(),
+            outgoing: Some(sample_smtp()),
+        };
+        let mut b = AccountConfig {
+            schema_version: SCHEMA_VERSION,
+            incoming: sample_incoming(),
+            outgoing: None,
+        };
+        b.incoming.user = "other@example.com".into();
+        let saved = ListShape {
+            schema_version: SCHEMA_VERSION,
+            accounts: vec![a.clone(), b.clone()],
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let list = parse_list(&json).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].incoming.user, "user@example.com");
+        assert_eq!(list[1].incoming.user, "other@example.com");
+    }
+
+    #[test]
+    fn v2_single_account_upgrades_to_one_element_list() {
+        let v2 = r#"{"schema_version":2,"incoming":{"host":"imap.example.com","port":993,"user":"user@example.com","password":"secret"},"outgoing":null}"#;
+        let list = parse_list(v2).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].incoming.user, "user@example.com");
+        assert!(list[0].outgoing.is_none());
+        assert_eq!(list[0].schema_version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -284,14 +361,13 @@ mod tests {
             parsed.outgoing.is_none(),
             "未知旧账号不得获得虚构 SMTP 配置"
         );
-        assert_eq!(parsed.schema_version, SCHEMA_VERSION);
     }
 
     #[test]
     fn unknown_schema_version_is_rejected_not_degraded() {
         let future = r#"{"schema_version":99,"incoming":{"host":"h","port":993,"user":"u","password":"p"},"outgoing":null}"#;
         let error = AccountConfig::parse(future).unwrap_err();
-        assert!(error.contains("不支持的账号配置版本 99"), "{error}");
+        assert!(error.contains("不支持的账号配置版本"), "{error}");
     }
 
     #[test]
@@ -402,6 +478,21 @@ mod tests {
         let parsed = AccountConfig::parse(&loaded).unwrap();
         assert_eq!(parsed.incoming, config.incoming);
         assert_eq!(parsed.outgoing, config.outgoing);
+
+        // v3 列表整体走 DPAPI 往返。
+        let second = AccountConfig {
+            schema_version: SCHEMA_VERSION,
+            incoming: ImapConfig {
+                user: "other@example.com".into(),
+                ..sample_incoming()
+            },
+            outgoing: None,
+        };
+        save_all_to(&path, &[config.clone(), second.clone()]).unwrap();
+        let round = list_from(&path).unwrap();
+        assert_eq!(round.len(), 2);
+        assert_eq!(round[1].incoming.user, "other@example.com");
+        assert!(round[0].outgoing.is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }

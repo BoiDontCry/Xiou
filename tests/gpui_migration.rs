@@ -35,7 +35,8 @@ mod compose_window {
                 },
                 |window, cx| {
                     // Reuse exactly the constructor called by ComposeWindow::open.
-                    let entity = cx.new(|cx| ComposeWindow::new(ComposeKind::New, window, cx));
+                    let entity =
+                        cx.new(|cx| ComposeWindow::new(ComposeKind::New, None, window, cx));
                     view = Some(entity.clone());
                     crate::ui::root_view(entity, window, cx)
                 },

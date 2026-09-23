@@ -272,6 +272,6 @@ mod tests {
     #[test]
     fn schema_marker_constant_is_single_sourced() {
         // 防呆：smtp.rs 与账号配置共用同一版本常量来源。
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 }

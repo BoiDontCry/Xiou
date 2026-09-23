@@ -67,6 +67,8 @@ pub struct ComposeWindow {
     cc: Entity<InputState>,
     subject: Entity<InputState>,
     body: Entity<TextareaState>,
+    /// 发件身份：账号配置里的收信用户名。None = 未指定（取第一个带 SMTP 的账号）。
+    sender_user: Option<String>,
     /// 窗口打开时刻的发件配置快照，用于只读展示；发送身份以点击发送时刻重新加载的配置为准。
     outgoing_display: Option<SmtpConfig>,
     send_state: SendState,
@@ -77,12 +79,20 @@ pub struct ComposeWindow {
 }
 
 impl ComposeWindow {
-    fn new(kind: ComposeKind, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        kind: ComposeKind,
+        sender_user: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (to_initial, cc_initial, subject_initial, body_initial) = draft_fields(&kind);
-        let outgoing_display = account_config::load()
-            .ok()
-            .flatten()
-            .and_then(|account| account.outgoing);
+        let accounts = account_config::list().unwrap_or_default();
+        let outgoing_display = resolve_sender(&accounts, &sender_user).map(|(_, smtp)| smtp);
+        let sender_user = Some(
+            resolve_sender(&accounts, &sender_user)
+                .map(|(user, _)| user)
+                .unwrap_or_else(|| sender_user.unwrap_or_default()),
+        );
 
         let to = cx.new(|cx| InputState::new(window, cx).placeholder("输入收件人地址"));
         to.update(cx, |state, cx| state.set_value(to_initial, window, cx));
@@ -106,6 +116,7 @@ impl ComposeWindow {
             cc,
             subject,
             body,
+            sender_user,
             outgoing_display,
             send_state: SendState::Idle,
             send_generation: 0,
@@ -116,6 +127,11 @@ impl ComposeWindow {
     }
 
     pub fn open(kind: ComposeKind, app: &mut App) {
+        Self::open_with_sender(kind, None, app);
+    }
+
+    /// 带 `sender_user`（收信用户名，即账号身份）打开写信窗口。
+    pub fn open_with_sender(kind: ComposeKind, sender_user: Option<String>, app: &mut App) {
         let bounds = Bounds::centered(None, size(px(720.), px(560.)), app);
         let _ = app.open_window(
             WindowOptions {
@@ -128,7 +144,7 @@ impl ComposeWindow {
                 ..Default::default()
             },
             |window, app| {
-                let view = app.new(|cx| Self::new(kind, window, cx));
+                let view = app.new(|cx| Self::new(kind, sender_user, window, cx));
                 crate::ui::root_view(view, window, app)
             },
         );
@@ -176,16 +192,24 @@ impl ComposeWindow {
             self.reject_send("正文不能为空", cx);
             return None;
         }
-        // 点击发送时刻的账号快照：加载、验证并冻结为不可变请求。
+        // 点击发送时刻的账号快照：按发件身份加载、验证并冻结为不可变请求。
         // 此后发生的设置变化不影响本次发送。
-        let account = match account_config::load() {
-            Ok(Some(account)) => account,
-            Ok(None) => {
-                self.reject_send("未保存邮箱账号，请先配置账号", cx);
-                return None;
-            }
+        let accounts = match account_config::list() {
+            Ok(accounts) => accounts,
             Err(error) => {
                 self.reject_send(&format!("读取账号配置失败：{error}"), cx);
+                return None;
+            }
+        };
+        let account = match resolve_sender(&accounts, &self.sender_user) {
+            Some((_, smtp)) if accounts.iter().any(|a| a.outgoing.as_ref() == Some(&smtp)) => {
+                accounts
+                    .into_iter()
+                    .find(|a| a.outgoing.as_ref() == Some(&smtp))
+                    .unwrap()
+            }
+            _ => {
+                self.reject_send("未保存邮箱账号或未配置发件（SMTP），请先在设置中配置", cx);
                 return None;
             }
         };
@@ -584,6 +608,29 @@ fn draft_key(kind: &ComposeKind) -> String {
     }
 }
 
+/// 从账号列表解析发件身份：优先 `sender_user` 指定且带 SMTP 的账号；
+/// 否则第一个带 SMTP 的账号。返回 (收信用户名, SMTP 配置)。
+fn resolve_sender(
+    accounts: &[foxmail_imap::account_config::AccountConfig],
+    sender_user: &Option<String>,
+) -> Option<(String, SmtpConfig)> {
+    if let Some(user) = sender_user.as_deref().filter(|u| !u.trim().is_empty()) {
+        if let Some(account) = accounts
+            .iter()
+            .find(|a| a.outgoing.is_some() && a.incoming.user.trim() == user.trim())
+        {
+            let smtp = account.outgoing.clone().unwrap();
+            return Some((account.incoming.user.trim().to_owned(), smtp));
+        }
+    }
+    accounts.iter().find(|a| a.outgoing.is_some()).map(|a| {
+        (
+            a.incoming.user.trim().to_owned(),
+            a.outgoing.clone().unwrap(),
+        )
+    })
+}
+
 fn current_draft(window: &ComposeWindow, cx: &App) -> DraftData {
     DraftData {
         to: window.to.read(cx).value().to_string(),
@@ -625,7 +672,7 @@ fn compose_hint(kind: &ComposeKind) -> SharedString {
     format!("{} · Ctrl/Cmd+Enter 发送 · Esc 关闭", text).into()
 }
 
-fn reply_draft(detail: &MessageDetail) -> ReplyDraft {
+pub fn reply_draft(detail: &MessageDetail) -> ReplyDraft {
     ReplyDraft {
         message_id: detail.id,
         recipient: detail.sender.clone(),
@@ -634,7 +681,7 @@ fn reply_draft(detail: &MessageDetail) -> ReplyDraft {
     }
 }
 
-fn forward_draft(detail: &MessageDetail) -> ForwardDraft {
+pub fn forward_draft(detail: &MessageDetail) -> ForwardDraft {
     ForwardDraft {
         message_id: detail.id,
         subject: prefixed_subject("Fwd: ", &detail.subject),

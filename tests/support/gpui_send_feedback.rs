@@ -27,6 +27,7 @@ fn open_send_fixture(cx: &mut App, id: i64) -> SendFixture {
                             subject: "E5 isolated send fixture".into(),
                             quoted_body: "离线邮件正文。".into(),
                         }),
+                        None,
                         window,
                         cx,
                     )
@@ -131,7 +132,7 @@ fn seed_offline_account() {
             from_address: "sender@example.invalid".into(),
         }),
     };
-    account_config::save(&seeded).expect("seed isolated account config");
+    account_config::save_all(&[seeded]).expect("seed isolated account config");
 }
 
 fn begin_local_send(
