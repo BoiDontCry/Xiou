@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Performance baseline & budget (N7) — 2026-09-23 (unreleased)
+
+- First quantitative baseline on the 10,013-message corpus with the
+  multi-account build: startup peak working set 73.4–85.6 MiB (3 runs,
+  no hangs), 10-minute dwell shows no growth trend (3/3), FTS search
+  marginal latency 10–25 ms warm (one 1.58 s cold-cache outlier noted).
+  Compared against the 2026-09-20 E9 candidate: no startup-memory
+  regression from the multi-account work.
+- Budgets defined in `docs/PERF-BASELINE.md` (startup WS/private ≤120 MiB,
+  dwell no-growth, search P95 ≤200 ms at 10k) — derived by padding the
+  measured maxima by ~40%, to be re-run each release. Uncovered items are
+  listed explicitly: GUI scroll/page latency, read_only open timing,
+  100k+ corpus.
+- `import-eml` fix: passing `--search` without an explicit `--data`/
+  `--archive` no longer runs the import step (it previously failed with
+  a confusing ENOENT when the default `data` dir was absent); query-only
+  invocations now skip import.
+
 ### Failure-path recovery guidance — 2026-09-23 (unreleased)
 
 - IMAP login failures now carry an actionable hint: auth rejections point
