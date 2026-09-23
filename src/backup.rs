@@ -250,13 +250,19 @@ pub fn connect(
             Ok(tcp) => {
                 tcp.set_read_timeout(Some(IMAP_IO_TIMEOUT))?;
                 tcp.set_write_timeout(Some(IMAP_IO_TIMEOUT))?;
-                let tls = TlsConnector::builder().build()?;
-                let stream = tls.connect(host, tcp)?;
+                let tls = match TlsConnector::builder().build() {
+                    Ok(tls) => tls,
+                    Err(error) => return Err(crate::imap_errors::connect_error(error).into()),
+                };
+                let stream = match tls.connect(host, tcp) {
+                    Ok(stream) => stream,
+                    Err(error) => return Err(crate::imap_errors::connect_error(error).into()),
+                };
                 let mut client = imap::Client::new(stream);
                 client.read_greeting()?;
                 return Ok(client);
             }
-            Err(error) => last_error = Some(error.into()),
+            Err(error) => last_error = Some(crate::imap_errors::connect_error(error).into()),
         }
     }
     Err(last_error.unwrap_or_else(|| format!("无法解析 {host}:{port}").into()))

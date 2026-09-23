@@ -52,7 +52,7 @@ pub fn index_message(problem: IndexProblem, operation: &str, index: &Path) -> St
         .to_string_lossy();
     match problem {
         IndexProblem::Corrupt => format!(
-            "邮件索引已损坏或格式无效：{}。请重新运行 import-eml 生成索引。",
+            "邮件索引已损坏或格式无效：{}。处理：关闭程序后把该文件改名（如加 .corrupt-bak 后缀），重新启动并重新输入账号同步；本地已备份的邮件会自动快速重建，无需重新下载。",
             index
         ),
         IndexProblem::CannotOpen => format!(
@@ -159,7 +159,7 @@ mod tests {
             Path::new("private/data/mail-index.sqlite"),
         );
         assert!(message.contains("索引已损坏"));
-        assert!(message.contains("import-eml"));
+        assert!(message.contains("无需重新下载"));
         assert!(!message.contains("private"));
     }
 

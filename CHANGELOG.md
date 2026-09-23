@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Failure-path recovery guidance — 2026-09-23 (unreleased)
+
+- IMAP login failures now carry an actionable hint: auth rejections point
+  to the authorization-code path, timeouts to the 993/port check, TLS
+  handshake failures to the port/security mismatch; connect failures
+  (refused/unreachable/DNS) tell the user to verify server address and
+  network. Details from the server are preserved verbatim after the hint.
+- Corrupt-index message no longer tells GUI users to run `import-eml`;
+  it now explains the real recovery: rename the broken file aside,
+  restart, re-enter the account, and sync rebuilds from the local EML
+  backups without re-downloading.
+- DPAPI config load failures (typically after OS reinstall or switching
+  machines) now explain the cause and the GUI recovery path (re-add the
+  account in settings; saving rebuilds the encrypted config for the
+  current Windows user).
+- New tests: login hint classification, connect hint branches, DPAPI
+  guidance, corrupt-index wording. Gates re-passed: fmt, 69 lib tests,
+  226 native checks, clippy -D warnings, reproducible double-package
+  (a1945985...701768), isolated auto-exit exit 0.
+
 ### Multi-account support — 2026-09-23 (unreleased)
 
 - Account config schema v3: `account-config.dpapi` now stores an account

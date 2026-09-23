@@ -259,8 +259,41 @@ fn list_from(path: &std::path::Path) -> Result<Vec<AccountConfig>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let json = credentials::load_password(path).map_err(|error| error.to_string())?;
-    parse_list(&json)
+    credentials::load_password(path)
+        .map_err(|error| explain_credential_error(&error.to_string()))
+        .and_then(|json| parse_list(&json))
+}
+
+/// DPAPI 失败多见于系统重装/换电脑（当前 Windows 用户与加密时不同）。
+/// 给 GUI 用户可执行的恢复路径，而不是 CLI 参数。
+fn explain_credential_error(message: &str) -> String {
+    if message.contains("DPAPI") {
+        format!(
+            "{message}。这通常发生在系统重装或换电脑后（当前 Windows 用户无法解密原配置）。请在设置中重新添加账号；保存后会用当前用户的加密重建配置。"
+        )
+    } else {
+        message.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod credential_error_tests {
+    use super::explain_credential_error;
+
+    #[test]
+    fn dpapi_failure_gets_recovery_guidance() {
+        let message = explain_credential_error(
+            "无法读取 Windows DPAPI 凭据：解密失败。请使用 --reset-password 在本机重新输入密码。",
+        );
+        assert!(message.contains("系统重装或换电脑"), "{message}");
+        assert!(message.contains("重新添加账号"), "{message}");
+    }
+
+    #[test]
+    fn other_credential_errors_stay_untouched() {
+        let message = explain_credential_error("账号配置 JSON 无效：expected value");
+        assert_eq!(message, "账号配置 JSON 无效：expected value");
+    }
 }
 
 /// 兼容旧单账号读取：取第一个账号。
