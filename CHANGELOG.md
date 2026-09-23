@@ -30,7 +30,7 @@
   the old sole-account behavior (and errors clearly when ambiguous).
 - Gates: fmt/check, 64 lib-bin + 65 lib tests, 226 native checks, clippy
   -D warnings, release build, reproducible double-package
-  (ecc9e9c9...9a13e).
+  (e192c314...8bf8f1).
 
 ### Unified account model + SMTP send refactor (phase 2) — 2026-09-22 (unreleased)
 

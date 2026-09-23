@@ -1585,11 +1585,38 @@ impl MailApp {
         }
 
         card = card.child(
-            control_button("start-sync-button", theme, ButtonKind::Primary, false)
-                .h(rems(2.25))
-                .text_sm()
-                .child("拉取邮件")
-                .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    // 编辑/添加已有账号时可放弃；首启（无任何账号）没有可回的主界面。
+                    if self
+                        .onboarding
+                        .as_ref()
+                        .is_some_and(|o| o.editing.is_some())
+                        || account_config::list()
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(false)
+                    {
+                        control_button("cancel-account-button", theme, ButtonKind::Secondary, false)
+                            .h(rems(2.25))
+                            .text_sm()
+                            .child("取消")
+                            .on_click(cx.listener(Self::cancel_account_editor))
+                            .into_any_element()
+                    } else {
+                        Empty.into_any_element()
+                    },
+                )
+                .child(
+                    control_button("start-sync-button", theme, ButtonKind::Primary, false)
+                        .h(rems(2.25))
+                        .text_sm()
+                        .child("拉取邮件")
+                        .on_click(cx.listener(|this, _, _, cx| this.start_sync(cx))),
+                ),
         );
 
         // SMTP 字段加入后卡片可能超出视口：与 sync-panel 相同的最大高度 +
@@ -1847,6 +1874,15 @@ impl MailApp {
 
     fn return_to_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_account_editor(Some(0), window, cx);
+    }
+
+    /// 放弃添加/编辑账号：关掉卡片回到主界面（不保存任何字段）。
+    fn cancel_account_editor(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.onboarding = None;
+        self.pending_account_removal = None;
+        // 让后台轮询恢复（编辑期间同步被挂起）。
+        self.maybe_start_background_sync(cx);
+        cx.notify();
     }
 
     /// 打开账号编辑/新增卡片：index = Some(i) 编辑第 i 个账号；None 新增。
